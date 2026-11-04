@@ -109,27 +109,11 @@ function denyAccess(ctx) {
     return ctx.reply('⛔ Бот лише за запрошенням. Попроси у власника інвайт-посилання.');
 }
 
-function adminKeyboard() {
+function mainKeyboard() {
     return Markup.keyboard([
         ['💡 Перевірити світло вдома'],
         ['📅 Графік YASNO']
     ]).resize();
-}
-
-function memberButtons() {
-    return Markup.inlineKeyboard([
-        [Markup.button.callback('💡 Перевірити світло вдома', 'check_light')],
-        [Markup.button.callback('📅 Графік YASNO', 'yasno_schedule')]
-    ]);
-}
-
-async function sendWelcome(ctx, text) {
-    if (isAdmin(ctx.from.id)) {
-        return ctx.reply(text, adminKeyboard());
-    }
-    // Reply-клавіатуру треба зняти окремим повідомленням — Telegram не міксує її з inline
-    await ctx.reply('✅ Доступ активний.', Markup.removeKeyboard());
-    return ctx.reply(text, memberButtons());
 }
 
 function createInvite(createdBy) {
@@ -495,7 +479,7 @@ bot.start(async (ctx) => {
 
     if (payload) {
         if (isAllowed(ctx.from.id)) {
-            return sendWelcome(ctx, 'Оберіть дію:');
+            return ctx.reply('✅ У вас уже є доступ.', mainKeyboard());
         }
 
         const result = redeemInvite(payload, ctx.from);
@@ -503,21 +487,18 @@ bot.start(async (ctx) => {
             return ctx.reply(`⛔ ${result.reason}`);
         }
 
-        return sendWelcome(ctx, '✅ Запрошення прийнято! Оберіть дію:');
+        return ctx.reply('✅ Запрошення прийнято! Оберіть дію на клавіатурі нижче:', mainKeyboard());
     }
 
     if (!isAllowed(ctx.from.id)) {
         return denyAccess(ctx);
     }
 
-    if (isAdmin(ctx.from.id)) {
-        return ctx.reply(
-            'Привіт! Оберіть дію на клавіатурі нижче:\n\nАдмін-команди:\n/invite — створити запрошення\n/users — список користувачів\n/kick <id> — забрати доступ',
-            adminKeyboard()
-        );
-    }
+    const hint = isAdmin(ctx.from.id)
+        ? '\n\nАдмін-команди:\n/invite — створити запрошення\n/users — список користувачів\n/kick <id> — забрати доступ'
+        : '';
 
-    return sendWelcome(ctx, 'Привіт! Оберіть дію:');
+    return ctx.reply(`Привіт! Оберіть дію на клавіатурі нижче:${hint}`, mainKeyboard());
 });
 
 bot.command('invite', async (ctx) => {
@@ -582,36 +563,17 @@ bot.command('kick', async (ctx) => {
     return ctx.reply(`🗑️ Доступ для \`${targetId}\` скасовано.`, { parse_mode: 'Markdown' });
 });
 
-// Reply-клавіатура — лише для адміна
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) {
-        return ctx.reply('⛔ Користуйтесь кнопками під повідомленням.', memberButtons());
+    if (!isAllowed(ctx.from.id)) {
+        return denyAccess(ctx);
     }
     return replyLightStatus(ctx);
 });
 
 bot.hears('📅 Графік YASNO', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) {
-        return ctx.reply('⛔ Користуйтесь кнопками під повідомленням.', memberButtons());
-    }
-    return replyYasnoSchedule(ctx);
-});
-
-bot.action('check_light', async (ctx) => {
     if (!isAllowed(ctx.from.id)) {
-        await ctx.answerCbQuery('Немає доступу');
         return denyAccess(ctx);
     }
-    await ctx.answerCbQuery();
-    return replyLightStatus(ctx);
-});
-
-bot.action('yasno_schedule', async (ctx) => {
-    if (!isAllowed(ctx.from.id)) {
-        await ctx.answerCbQuery('Немає доступу');
-        return denyAccess(ctx);
-    }
-    await ctx.answerCbQuery();
     return replyYasnoSchedule(ctx);
 });
 
