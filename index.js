@@ -2,7 +2,6 @@ const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const net = require('net');
 
 // Токен твого бота та твій Telegram ID
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
@@ -11,9 +10,11 @@ const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 // Список користувачів, яким дозволено користуватися ботом
 const ALLOWED_USERS = [350523892];
 
-// Домашня IP-адреса роутера та порт для перевірки
-const HOME_HOST = process.env.HOME_HOST || '85.114.199.189';
-const HOME_PORT = Number(process.env.HOME_PORT) || 80;
+// Дані Tuya / Smart Life (розетка "Напруга дома")
+const TUYA_CLIENT_ID = process.env.TUYA_CLIENT_ID;
+const TUYA_SECRET = process.env.TUYA_SECRET;
+const DEVICE_ID = process.env.TUYA_DEVICE_ID || 'bff0b6603044b5be61heq2';
+const REGION = process.env.TUYA_REGION || 'eu';
 
 // Адреса для графіка YASNO (Київ, вул. Анни Ахматової, 13Д)
 const YASNO_REGION_ID = 25;
@@ -37,36 +38,37 @@ const YASNO_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 };
 
-// Перевірка світла через TCP-з'єднання з роутером
-function checkHomeTcp() {
-    return new Promise((resolve) => {
-        const socket = new net.Socket();
-        let isAlive = false;
+// Перевірка статусу розетки Smart Life / Tuya API
+async function getSmartLifeStatus() {
+    try {
+        const t = Date.now().toString();
+        const clientId = TUYA_CLIENT_ID;
+        const secret = TUYA_SECRET;
 
-        socket.setTimeout(3000);
+        const signUrl = `/v1.0/iot-03/devices/${DEVICE_ID}`;
+        const stringToSign = `GET\n${crypto.createHash('sha256').update('').digest('hex')}\n\n${signUrl}`;
+        const signStr = clientId + t + stringToSign;
+        const sign = crypto.createHmac('sha256', secret).update(signStr).digest('hex').toUpperCase();
 
-        socket.on('connect', () => {
-            isAlive = true;
-            socket.destroy();
-        });
-
-        socket.on('error', (err) => {
-            if (err.code === 'ECONNREFUSED' || err.code === 'EHOSTUNREACH') {
-                isAlive = true;
+        const response = await fetch(`https://openapi.tuya${REGION}.com${signUrl}`, {
+            method: 'GET',
+            headers: {
+                'client_id': clientId,
+                't': t,
+                'sign': sign,
+                'sign_method': 'HMAC-SHA256'
             }
-            socket.destroy();
         });
 
-        socket.on('timeout', () => {
-            socket.destroy();
-        });
-
-        socket.on('close', () => {
-            resolve(isAlive);
-        });
-
-        socket.connect(HOME_PORT, HOME_HOST);
-    });
+        const data = await response.json();
+        if (data.success && data.result) {
+            return data.result.online; // true, якщо розетка на зв'язку з хмарою
+        }
+        return false;
+    } catch (error) {
+        console.error('Помилка запиту до Smart Life (Tuya):', error);
+        return false;
+    }
 }
 
 function minutesToTime(minutes) {
@@ -237,14 +239,15 @@ async function getYasnoSchedule() {
     }
 }
 
+// Фонова перевірка (статус розетки кожні 2 хвилини + оновлення YASNO)
 setInterval(async () => {
     try {
-        const isOnline = await checkHomeTcp();
+        const isOnline = await getSmartLifeStatus();
         if (lastPowerStatus !== null && lastPowerStatus !== isOnline) {
             lastPowerStatus = isOnline;
             const alertText = isOnline
-                ? '🟢 *Світло зʼявилося!* (Роутер на звʼязку)'
-                : '🔴 *Світло зникло!* (Роутер не відповідає)';
+                ? '🟢 *Світло зʼявилося!* (Розетка в мережі)'
+                : '🔴 *Світло зникло!* (Розетка офлайн)';
 
             for (const userId of ALLOWED_USERS) {
                 await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
@@ -296,15 +299,15 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
     }
 
-    const loadingMsg = await ctx.reply("⏳ Перевіряю з'єднання з роутером...");
-    const isOnline = await checkHomeTcp();
+    const loadingMsg = await ctx.reply("⏳ Перевіряю стан розетки...");
+    const isOnline = await getSmartLifeStatus();
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
     if (isOnline) {
-        ctx.reply('🟢 Світло є! (Роутер на звʼязку)');
+        ctx.reply('🟢 Світло є! (Розетка на звʼязку)');
     } else {
-        ctx.reply('🔴 Світла немає / роутер офлайн!');
+        ctx.reply('🔴 Світла немає! (Розетка офлайн)');
     }
 });
 
@@ -333,7 +336,7 @@ const PORT = process.env.PORT || 3000;
 app.use(bot.webhookCallback(`/bot${TOKEN}`));
 
 app.get('/', (req, res) => {
-    res.send('Atorch Telegram Bot is running with TCP monitoring!');
+    res.send('Smart Life / Atorch Telegram Bot is running!');
 });
 
 app.listen(PORT, async () => {
