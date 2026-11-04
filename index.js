@@ -2,7 +2,7 @@ const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const ping = require('ping');
+const net = require('net');
 
 // Токен твого бота та твій Telegram ID
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
@@ -11,8 +11,9 @@ const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 // Список користувачів, яким дозволено користуватися ботом
 const ALLOWED_USERS = [350523892];
 
-// Домашня IP-адреса роутера для пінгу
+// Домашня IP-адреса роутера та порт для перевірки
 const HOME_HOST = process.env.HOME_HOST || '85.114.199.189';
+const HOME_PORT = Number(process.env.HOME_PORT) || 80; // Порт для TCP-перевірки
 
 // Адреса для графіка YASNO (Київ, вул. Анни Ахматової, 13Д)
 const YASNO_REGION_ID = 25;
@@ -36,17 +37,37 @@ const YASNO_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 };
 
-// Перевірка світла через пінгування домашнього роутера
-async function checkHomePing() {
-    try {
-        const res = await ping.promise.probe(HOME_HOST, {
-            timeout: 3, // таймаут в секундах
+// Перевірка світла через TCP-з'єднання з роутером
+function checkHomeTcp() {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+        let isAlive = false;
+
+        socket.setTimeout(3000); // Таймаут 3 секунди
+
+        socket.on('connect', () => {
+            isAlive = true;
+            socket.destroy();
         });
-        return res.alive; // true, якщо роутер відповідає (світло є)
-    } catch (error) {
-        console.error('Помилка пінгу роутера:', error);
-        return false;
-    }
+
+        socket.on('error', (err) => {
+            // ECONNREFUSED означає, що IP доступний і роутер у мережі (просто порт закритий)
+            if (err.code === 'ECONNREFUSED' || err.code === 'EHOSTUNREACH') {
+                isAlive = true;
+            }
+            socket.destroy();
+        });
+
+        socket.on('timeout', () => {
+            socket.destroy();
+        });
+
+        socket.on('close', () => {
+            resolve(isAlive);
+        });
+
+        socket.connect(HOME_PORT, HOME_HOST);
+    });
 }
 
 function minutesToTime(minutes) {
@@ -218,16 +239,16 @@ async function getYasnoSchedule() {
     }
 }
 
-// Фонова перевірка (пінг роутера кожні 2 хвилини + перевірка оновлень YASNO)
+// Фонова перевірка (TCP-перевірка кожні 2 хвилини + оновлення YASNO)
 setInterval(async () => {
     try {
-        // 1. Моніторинг світла через пінг
-        const isOnline = await checkHomePing();
+        // 1. Моніторинг світла через TCP
+        const isOnline = await checkHomeTcp();
         if (lastPowerStatus !== null && lastPowerStatus !== isOnline) {
             lastPowerStatus = isOnline;
             const alertText = isOnline
-                ? '🟢 *Світло зʼявилося!* (Роутер знову на звʼязку)'
-                : '🔴 *Світло зникло!* (Роутер не відповідає на пінг)';
+                ? '🟢 *Світло зʼявилося!*'
+                : '🔴 *Світло зникло!*';
 
             for (const userId of ALLOWED_USERS) {
                 await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
@@ -276,14 +297,14 @@ bot.start((ctx) => {
     );
 });
 
-// Кнопка перевірки світла через пінг роутера
+// Кнопка перевірки світла через TCP
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
     }
 
-    const loadingMsg = await ctx.reply('⏳ Пінгую домашню мережу...');
-    const isOnline = await checkHomePing();
+    const loadingMsg = await ctx.reply('⏳ Перевіряю з'єднання з роутером...');
+    const isOnline = await checkHomeTcp();
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
@@ -320,7 +341,7 @@ const PORT = process.env.PORT || 3000;
 app.use(bot.webhookCallback(`/bot${TOKEN}`));
 
 app.get('/', (req, res) => {
-    res.send('Atorch Telegram Bot is running with Ping monitoring!');
+    res.send('Atorch Telegram Bot is running with TCP monitoring!');
 });
 
 app.listen(PORT, async () => {
