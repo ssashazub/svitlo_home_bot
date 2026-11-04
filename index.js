@@ -2,7 +2,10 @@ const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
+<<<<<<< HEAD
 const ping = require('ping');
+=======
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 
 // Токен твого бота та твій Telegram ID
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
@@ -11,10 +14,20 @@ const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 // Список користувачів, яким дозволено користуватися ботом
 const ALLOWED_USERS = [350523892];
 
+<<<<<<< HEAD
 // Домашня IP-адреса роутера для пінгу (з твого скріншота)
 const HOME_HOST = process.env.HOME_HOST || '85.114.199.189';
 
 // Адреса для графіка YASNO (Київ, вул. Анни Ахматової, 13Д)
+=======
+// Дані Tuya IoT
+const TUYA_CLIENT_ID = process.env.TUYA_CLIENT_ID;
+const TUYA_SECRET = process.env.TUYA_SECRET;
+const DEVICE_ID = process.env.TUYA_DEVICE_ID;
+const REGION = process.env.TUYA_REGION || 'eu';
+
+// Адреса для графіка YASNO (Київ)
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 const YASNO_REGION_ID = 25;
 const YASNO_DSO_ID = 902;
 const YASNO_STREET = process.env.YASNO_STREET || 'вул. Ахматової Анни';
@@ -29,13 +42,17 @@ app.use(express.json());
 
 let lastYasnoHash = null;
 let cachedYasnoGroup = null;
+<<<<<<< HEAD
 let lastPowerStatus = null; // Для відстеження зміни стану світла
+=======
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 
 const YASNO_HEADERS = {
     Accept: 'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 };
 
+<<<<<<< HEAD
 // Перевірка світла через пінгування домашнього роутера
 async function checkHomePing() {
     try {
@@ -45,6 +62,37 @@ async function checkHomePing() {
         return res.alive; // true, якщо роутер відповідає (світло є)
     } catch (error) {
         console.error('Помилка пінгу роутера:', error);
+=======
+// Перевірка статусу розетки Atorch через Tuya API
+async function getAtorchStatus() {
+    try {
+        const t = Date.now().toString();
+        const clientId = TUYA_CLIENT_ID;
+        const secret = TUYA_SECRET;
+
+        const signUrl = `/v1.0/iot-03/devices/${DEVICE_ID}`;
+        const stringToSign = `GET\n${crypto.createHash('sha256').update('').digest('hex')}\n\n${signUrl}`;
+        const signStr = clientId + t + stringToSign;
+        const sign = crypto.createHmac('sha256', secret).update(signStr).digest('hex').toUpperCase();
+
+        const response = await fetch(`https://openapi.tuya${REGION}.com${signUrl}`, {
+            method: 'GET',
+            headers: {
+                'client_id': clientId,
+                't': t,
+                'sign': sign,
+                'sign_method': 'HMAC-SHA256'
+            }
+        });
+
+        const data = await response.json();
+        if (data.success) {
+            return data.result.online;
+        }
+        return false;
+    } catch (error) {
+        console.error('Помилка запиту до Tuya:', error);
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
         return false;
     }
 }
@@ -100,7 +148,11 @@ function formatSlots(slots) {
         return '🟢 Відключень за графіком немає.';
     }
 
+<<<<<<< HEAD
     // Виправлене сортування та об'єднання інтервалів відключень
+=======
+    // Зливаємо сусідні інтервали відключень
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
     const sorted = outages
         .map((s) => ({ start: Number(s.start), end: Number(s.end) }))
         .sort((a, b) => a.start - b.start);
@@ -124,7 +176,11 @@ function formatDayBlock(title, day) {
     if (!day) return `*${title}:*\nДані відсутні.`;
 
     const lines = [
+<<<<<<< HEAD
         `*${title} (${formatDayDate(day.date)})*`,
+=======
+        `*${title}* (${formatDayDate(day.date)})`,
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
         statusLabel(day.status)
     ].filter(Boolean);
 
@@ -219,6 +275,7 @@ async function getYasnoSchedule() {
     }
 }
 
+<<<<<<< HEAD
 // Фонова перевірка (плід роутера кожні 2 хвилини + перевірка оновлень графіка YASNO кожні 10 хвилин)
 setInterval(async () => {
     try {
@@ -239,6 +296,11 @@ setInterval(async () => {
         }
 
         // 2. Перевірка оновлень графіків YASNO
+=======
+// Фонова перевірка оновлень графіка (кожні 10 хвилин)
+setInterval(async () => {
+    try {
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
@@ -260,7 +322,11 @@ setInterval(async () => {
     } catch (e) {
         console.error('Помилка у фоновій перевірці:', e);
     }
+<<<<<<< HEAD
 }, 2 * 60 * 1000);
+=======
+}, 10 * 60 * 1000);
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 
 // Команда /start
 bot.start((ctx) => {
@@ -277,21 +343,36 @@ bot.start((ctx) => {
     );
 });
 
+<<<<<<< HEAD
 // Кнопка перевірки світла через пінг роутера
+=======
+// Кнопка перевірки світла через розетку
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
     }
 
+<<<<<<< HEAD
     const loadingMsg = await ctx.reply('⏳ Пінгую домашню мережу...');
     const isOnline = await checkHomePing();
+=======
+    const loadingMsg = await ctx.reply('⏳ Перевіряю стан...');
+    const isOnline = await getAtorchStatus();
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
     if (isOnline) {
+<<<<<<< HEAD
         ctx.reply('🟢 Світло є! (Роутер на звʼязку)');
     } else {
         ctx.reply('🔴 Світла немає / роутер офлайн!');
+=======
+        ctx.reply('🟢 Світло є! (Розетка в мережі)');
+    } else {
+        ctx.reply('🔴 Світла немає! (Розетка офлайн)');
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
     }
 });
 
@@ -321,7 +402,11 @@ const PORT = process.env.PORT || 3000;
 app.use(bot.webhookCallback(`/bot${TOKEN}`));
 
 app.get('/', (req, res) => {
+<<<<<<< HEAD
     res.send('Atorch Telegram Bot is running with Ping monitoring!');
+=======
+    res.send('Atorch Telegram Bot is running!');
+>>>>>>> fd2e9b30f5164dae5272476ad7a7645e5ce98cdb
 });
 
 app.listen(PORT, async () => {
