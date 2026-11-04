@@ -303,7 +303,7 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
     }
 
-    const loadingMsg = await ctx.reply('⏳ Перевіряю з'єднання з роутером...');
+    const loadingMsg = await ctx.reply("⏳ Перевіряю з'єднання з роутером...");
     const isOnline = await checkHomeTcp();
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
