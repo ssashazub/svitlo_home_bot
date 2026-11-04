@@ -41,12 +41,41 @@ const YASNO_API = 'https://app.yasno.ua/api/blackout-service/public';
 const bot = new Telegraf(TOKEN);
 const app = express();
 
-let lastYasnoHash = null;
-let lastYasnoNotifyAt = 0;
+const YASNO_STATE_FILE = path.join(DATA_DIR, 'yasno-state.json');
+const YASNO_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000;
+
+function loadYasnoState() {
+    try {
+        if (fs.existsSync(YASNO_STATE_FILE)) {
+            const parsed = JSON.parse(fs.readFileSync(YASNO_STATE_FILE, 'utf8'));
+            return {
+                lastHash: parsed.lastHash || null,
+                lastNotifiedHash: parsed.lastNotifiedHash || null,
+                lastNotifyAt: Number(parsed.lastNotifyAt) || 0
+            };
+        }
+    } catch (error) {
+        console.error('Не вдалося прочитати yasno-state.json:', error.message || error);
+    }
+    return { lastHash: null, lastNotifiedHash: null, lastNotifyAt: 0 };
+}
+
+function saveYasnoState(state) {
+    try {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        fs.writeFileSync(YASNO_STATE_FILE, JSON.stringify(state, null, 2));
+    } catch (error) {
+        console.error('Не вдалося зберегти yasno-state.json:', error.message || error);
+    }
+}
+
+let yasnoState = loadYasnoState();
+let lastYasnoHash = yasnoState.lastHash;
+let lastYasnoNotifiedHash = yasnoState.lastNotifiedHash;
+let lastYasnoNotifyAt = yasnoState.lastNotifyAt;
 let yasnoCheckInProgress = false;
 let cachedYasnoGroup = null;
 let botUsername = null;
-const YASNO_NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
 
 function defaultAccess() {
     return {
@@ -354,22 +383,18 @@ function statusLabel(status) {
     }
 }
 
-function formatSlots(slots) {
-    if (!Array.isArray(slots) || slots.length === 0) {
-        return 'Немає опублікованих слотів.';
-    }
-
-    const outages = slots.filter((s) => {
+function mergeOutageSlots(slots) {
+    const outages = (Array.isArray(slots) ? slots : []).filter((s) => {
         const type = String(s.type || '').toLowerCase();
         return type.includes('definite') || type.includes('outage');
     });
 
-    if (outages.length === 0) {
-        return '🟢 Відключень за графіком немає.';
-    }
-
     const sorted = outages
-        .map((s) => ({ start: Number(s.start), end: Number(s.end) }))
+        .map((s) => ({
+            start: Math.max(0, Math.min(1440, Number(s.start) || 0)),
+            end: Math.max(0, Math.min(1440, Number(s.end) || 0))
+        }))
+        .filter((s) => s.end > s.start)
         .sort((a, b) => a.start - b.start);
 
     const merged = [];
@@ -381,10 +406,47 @@ function formatSlots(slots) {
             merged.push({ ...slot });
         }
     }
+    return merged;
+}
 
-    return merged
-        .map((s) => `🔴 ${minutesToTime(s.start)} – ${minutesToTime(s.end)}`)
-        .join('\n');
+function lightSlotsFromOutages(outages) {
+    const light = [];
+    let cursor = 0;
+    for (const outage of outages) {
+        if (outage.start > cursor) {
+            light.push({ start: cursor, end: outage.start });
+        }
+        cursor = Math.max(cursor, outage.end);
+    }
+    if (cursor < 1440) {
+        light.push({ start: cursor, end: 1440 });
+    }
+    return light;
+}
+
+function formatSlots(slots) {
+    if (!Array.isArray(slots) || slots.length === 0) {
+        return 'Немає опублікованих слотів.';
+    }
+
+    const outages = mergeOutageSlots(slots);
+
+    if (outages.length === 0) {
+        return '🟢 Світло весь день (00:00 – 24:00)';
+    }
+
+    const light = lightSlotsFromOutages(outages);
+    const parts = [];
+
+    if (light.length > 0) {
+        parts.push('*Світло є:*');
+        parts.push(...light.map((s) => `🟢 ${minutesToTime(s.start)} – ${minutesToTime(s.end)}`));
+    }
+
+    parts.push('*Відключення:*');
+    parts.push(...outages.map((s) => `🔴 ${minutesToTime(s.start)} – ${minutesToTime(s.end)}`));
+
+    return parts.join('\n');
 }
 
 function formatDayBlock(title, day) {
@@ -517,31 +579,69 @@ setInterval(async () => {
     if (yasnoCheckInProgress) return;
     yasnoCheckInProgress = true;
     try {
+        // Підхоплюємо стан з диска (на випадок рестарту / другого процесу на тому ж диску)
+        yasnoState = loadYasnoState();
+        lastYasnoHash = yasnoState.lastHash;
+        lastYasnoNotifiedHash = yasnoState.lastNotifiedHash;
+        lastYasnoNotifyAt = yasnoState.lastNotifyAt;
+
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
         if (lastYasnoHash === null) {
             lastYasnoHash = result.hash;
+            saveYasnoState({
+                lastHash: lastYasnoHash,
+                lastNotifiedHash: lastYasnoNotifiedHash,
+                lastNotifyAt: lastYasnoNotifyAt
+            });
             return;
         }
 
-        if (result.hash !== lastYasnoHash) {
-            lastYasnoHash = result.hash;
+        if (result.hash === lastYasnoHash) {
+            return;
+        }
 
-            // Антидубль: не слати повторно протягом 10 хв
-            if (Date.now() - lastYasnoNotifyAt < YASNO_NOTIFY_COOLDOWN_MS) {
-                console.log('YASNO: зміна є, але пропуск дубля через cooldown');
-                return;
-            }
-            lastYasnoNotifyAt = Date.now();
+        lastYasnoHash = result.hash;
 
-            const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
+        // Той самий контент уже відправляли — не дублюємо
+        if (result.hash === lastYasnoNotifiedHash) {
+            saveYasnoState({
+                lastHash: lastYasnoHash,
+                lastNotifiedHash: lastYasnoNotifiedHash,
+                lastNotifyAt: lastYasnoNotifyAt
+            });
+            console.log('YASNO: хеш вже був у сповіщенні, пропуск');
+            return;
+        }
 
-            for (const userId of allowedUserIds()) {
-                await bot.telegram.sendMessage(userId, notificationText, { parse_mode: 'Markdown' }).catch((err) => {
-                    console.error(`Не вдалося надіслати сповіщення користувачу ${userId}:`, err);
-                });
-            }
+        // Антидубль по часу (30 хв)
+        if (Date.now() - lastYasnoNotifyAt < YASNO_NOTIFY_COOLDOWN_MS) {
+            saveYasnoState({
+                lastHash: lastYasnoHash,
+                lastNotifiedHash: lastYasnoNotifiedHash,
+                lastNotifyAt: lastYasnoNotifyAt
+            });
+            console.log('YASNO: пропуск дубля через cooldown');
+            return;
+        }
+
+        // Фіксуємо ДО відправки, щоб паралельний тік/процес рідше продублював
+        lastYasnoNotifiedHash = result.hash;
+        lastYasnoNotifyAt = Date.now();
+        saveYasnoState({
+            lastHash: lastYasnoHash,
+            lastNotifiedHash: lastYasnoNotifiedHash,
+            lastNotifyAt: lastYasnoNotifyAt
+        });
+
+        const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
+        const recipients = [...new Set(allowedUserIds())];
+
+        for (const userId of recipients) {
+            await bot.telegram.sendMessage(userId, notificationText, { parse_mode: 'Markdown' }).catch((err) => {
+                console.error(`Не вдалося надіслати сповіщення користувачу ${userId}:`, err);
+            });
         }
     } catch (e) {
         console.error('Помилка у фоновій перевірці YASNO:', e);
