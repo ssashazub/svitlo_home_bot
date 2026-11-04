@@ -9,8 +9,14 @@ const fetch = require('node-fetch');
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
 const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 
-// Адміни можуть створювати запрошення. Інші юзери — лише за інвайтом.
+// Адміни керують інвайтами. Доступ — лише за запрошенням.
 const ADMIN_IDS = (process.env.ADMIN_IDS || '350523892')
+    .split(',')
+    .map((id) => Number(String(id).trim()))
+    .filter(Boolean);
+
+// Запрошені юзери, які НЕ злітають після редеплою. Приклад: MEMBER_IDS=111,222
+const MEMBER_IDS = (process.env.MEMBER_IDS || '')
     .split(',')
     .map((id) => Number(String(id).trim()))
     .filter(Boolean);
@@ -38,52 +44,68 @@ const app = express();
 app.use(express.json());
 
 let lastYasnoHash = null;
+let lastYasnoNotifyAt = 0;
+let yasnoCheckInProgress = false;
 let cachedYasnoGroup = null;
 let botUsername = null;
+const YASNO_NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
 
 function defaultAccess() {
     return {
-        users: ADMIN_IDS.map((id) => ({
-            id,
-            name: 'admin',
-            role: 'admin',
-            joinedAt: new Date().toISOString()
-        })),
+        users: [],
         invites: {}
     };
 }
 
+function ensureUserRecord(parsed, id, role, name = role) {
+    const existing = parsed.users.find((u) => Number(u.id) === Number(id));
+    if (existing) {
+        existing.role = role;
+        return existing;
+    }
+    const row = {
+        id: Number(id),
+        name,
+        username: null,
+        role,
+        joinedAt: new Date().toISOString()
+    };
+    parsed.users.push(row);
+    return row;
+}
+
 function loadAccess() {
     try {
-        if (!fs.existsSync(ACCESS_FILE)) return defaultAccess();
-        const parsed = JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf8'));
+        const parsed = fs.existsSync(ACCESS_FILE)
+            ? JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf8'))
+            : defaultAccess();
         if (!parsed.users || !Array.isArray(parsed.users)) parsed.users = [];
         if (!parsed.invites || typeof parsed.invites !== 'object') parsed.invites = {};
 
-        // Гарантуємо, що всі адміни завжди в списку
+        // Адміни + MEMBER_IDS з env завжди в списку (переживають редеплой)
         for (const adminId of ADMIN_IDS) {
-            if (!parsed.users.some((u) => Number(u.id) === adminId)) {
-                parsed.users.push({
-                    id: adminId,
-                    name: 'admin',
-                    role: 'admin',
-                    joinedAt: new Date().toISOString()
-                });
-            } else {
-                const user = parsed.users.find((u) => Number(u.id) === adminId);
-                user.role = 'admin';
+            ensureUserRecord(parsed, adminId, 'admin', 'admin');
+        }
+        for (const memberId of MEMBER_IDS) {
+            if (!ADMIN_IDS.includes(memberId)) {
+                ensureUserRecord(parsed, memberId, 'member', 'member');
             }
         }
         return parsed;
     } catch (error) {
         console.error('Не вдалося прочитати access.json:', error);
-        return defaultAccess();
+        const fallback = defaultAccess();
+        for (const adminId of ADMIN_IDS) ensureUserRecord(fallback, adminId, 'admin', 'admin');
+        for (const memberId of MEMBER_IDS) {
+            if (!ADMIN_IDS.includes(memberId)) ensureUserRecord(fallback, memberId, 'member', 'member');
+        }
+        return fallback;
     }
 }
 
-function saveAccess(access) {
+function saveAccess(data) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2));
+    fs.writeFileSync(ACCESS_FILE, JSON.stringify(data, null, 2));
 }
 
 let access = loadAccess();
@@ -95,24 +117,55 @@ function isAdmin(userId) {
 
 function isAllowed(userId) {
     const id = Number(userId);
-    return isAdmin(id) || access.users.some((u) => Number(u.id) === id);
+    return (
+        isAdmin(id) ||
+        MEMBER_IDS.includes(id) ||
+        access.users.some((u) => Number(u.id) === id)
+    );
 }
 
 function allowedUserIds() {
-    const ids = new Set(ADMIN_IDS);
+    const ids = new Set([...ADMIN_IDS, ...MEMBER_IDS]);
     for (const user of access.users) ids.add(Number(user.id));
     return [...ids];
 }
 
-function denyAccess(ctx) {
-    return ctx.reply('⛔ Бот лише за запрошенням. Попроси у власника інвайт-посилання.');
+function recommendedMemberIdsEnv() {
+    const ids = allowedUserIds().filter((id) => !isAdmin(id));
+    return ids.join(',');
 }
 
-function mainKeyboard() {
-    return Markup.keyboard([
+function mainKeyboard(userId) {
+    const rows = [
         ['💡 Перевірити світло вдома'],
         ['📅 Графік YASNO']
-    ]).resize();
+    ];
+    if (isAdmin(userId)) {
+        rows.push(['🎟️ Інвайт']);
+    }
+    return Markup.keyboard(rows).resize();
+}
+
+function denyAccess(ctx) {
+    return ctx.reply('⛔ Бот лише за запрошенням. Попроси в адміна інвайт.');
+}
+
+function addMember(from) {
+    const id = Number(from.id);
+    const existing = access.users.find((u) => Number(u.id) === id);
+    const profile = {
+        id,
+        name: [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(id),
+        username: from.username || null,
+        role: isAdmin(id) ? 'admin' : 'member',
+        joinedAt: existing?.joinedAt || new Date().toISOString()
+    };
+
+    if (existing) Object.assign(existing, profile);
+    else access.users.push(profile);
+
+    saveAccess(access);
+    return profile;
 }
 
 function createInvite(createdBy) {
@@ -127,25 +180,41 @@ function createInvite(createdBy) {
 }
 
 function redeemInvite(code, from) {
-    const invite = access.invites[code];
+    const invite = access.invites[String(code || '').trim()];
     if (!invite) return { ok: false, reason: 'Інвайт недійсний або вже використаний.' };
     if (invite.usedBy) return { ok: false, reason: 'Цей інвайт уже використано.' };
 
     invite.usedBy = Number(from.id);
     invite.usedAt = new Date().toISOString();
-
-    if (!access.users.some((u) => Number(u.id) === Number(from.id))) {
-        access.users.push({
-            id: Number(from.id),
-            name: [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id),
-            username: from.username || null,
-            role: isAdmin(from.id) ? 'admin' : 'member',
-            joinedAt: new Date().toISOString()
-        });
-    }
-
-    saveAccess(access);
+    addMember(from);
     return { ok: true };
+}
+
+async function notifyAdminsNewMember(from) {
+    const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || from.id;
+    const memberEnv = recommendedMemberIdsEnv();
+    const text =
+        `👤 Новий юзер за інвайтом: ${name} (\`${from.id}\`)\n\n` +
+        `Щоб після деплою не треба було інвайтити знову — постав у Render:\n` +
+        `\`MEMBER_IDS=${memberEnv}\``;
+
+    for (const adminId of ADMIN_IDS) {
+        await bot.telegram.sendMessage(adminId, text, { parse_mode: 'Markdown' }).catch(() => {});
+    }
+}
+
+async function sendInviteLink(ctx) {
+    if (!botUsername) {
+        const me = await bot.telegram.getMe();
+        botUsername = me.username;
+    }
+    const code = createInvite(ctx.from.id);
+    const link = `https://t.me/${botUsername}?start=${code}`;
+    return ctx.reply(
+        `🎟️ Одноразове запрошення:\n\`${code}\`\n\n${link}\n\n` +
+        `Після входу оновлю MEMBER_IDS у Render — і доступ не злетить після деплою.`,
+        { parse_mode: 'Markdown' }
+    );
 }
 
 const YASNO_HEADERS = {
@@ -359,6 +428,33 @@ async function resolveYasnoGroup() {
     return cachedYasnoGroup;
 }
 
+function yasnoDayFingerprint(day) {
+    if (!day) return null;
+    const slots = Array.isArray(day.slots)
+        ? day.slots
+            .map((s) => ({
+                start: Number(s.start),
+                end: Number(s.end),
+                type: String(s.type || '')
+            }))
+            .sort((a, b) => a.start - b.start || a.end - b.end || a.type.localeCompare(b.type))
+        : [];
+
+    return {
+        date: day.date || null,
+        status: day.status || null,
+        slots
+    };
+}
+
+function yasnoContentHash(groupData) {
+    const payload = {
+        today: yasnoDayFingerprint(groupData.today),
+        tomorrow: yasnoDayFingerprint(groupData.tomorrow)
+    };
+    return crypto.createHash('md5').update(JSON.stringify(payload)).digest('hex');
+}
+
 async function getYasnoSchedule() {
     try {
         const group = await resolveYasnoGroup();
@@ -374,8 +470,8 @@ async function getYasnoSchedule() {
             };
         }
 
-        const rawString = JSON.stringify(groupData);
-        const currentHash = crypto.createHash('md5').update(rawString).digest('hex');
+        // Хешуємо лише слоти/статус — не updatedOn і інші службові поля
+        const currentHash = yasnoContentHash(groupData);
 
         let text =
             `📅 *Графік відключень YASNO*\n` +
@@ -398,6 +494,8 @@ async function getYasnoSchedule() {
 
 // Фонова перевірка лише графіка YASNO (без Tuya — економимо квоту API)
 setInterval(async () => {
+    if (yasnoCheckInProgress) return;
+    yasnoCheckInProgress = true;
     try {
         const result = await getYasnoSchedule();
         if (!result.hash) return;
@@ -409,6 +507,14 @@ setInterval(async () => {
 
         if (result.hash !== lastYasnoHash) {
             lastYasnoHash = result.hash;
+
+            // Антидубль: не слати повторно протягом 10 хв
+            if (Date.now() - lastYasnoNotifyAt < YASNO_NOTIFY_COOLDOWN_MS) {
+                console.log('YASNO: зміна є, але пропуск дубля через cooldown');
+                return;
+            }
+            lastYasnoNotifyAt = Date.now();
+
             const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
 
             for (const userId of allowedUserIds()) {
@@ -419,6 +525,8 @@ setInterval(async () => {
         }
     } catch (e) {
         console.error('Помилка у фоновій перевірці YASNO:', e);
+    } finally {
+        yasnoCheckInProgress = false;
     }
 }, 2 * 60 * 1000);
 
@@ -444,6 +552,10 @@ async function replyYasnoSchedule(ctx) {
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
+    if (result.hash) {
+        lastYasnoHash = result.hash;
+    }
+
     const inlineKeyboard = Markup.inlineKeyboard([
         [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://static.yasno.ua/kyiv/outages')]
     ]);
@@ -459,7 +571,8 @@ bot.start(async (ctx) => {
 
     if (payload) {
         if (isAllowed(ctx.from.id)) {
-            return ctx.reply('✅ У вас уже є доступ.', mainKeyboard());
+            addMember(ctx.from);
+            return ctx.reply('✅ У вас уже є доступ.', mainKeyboard(ctx.from.id));
         }
 
         const result = redeemInvite(payload, ctx.from);
@@ -467,36 +580,35 @@ bot.start(async (ctx) => {
             return ctx.reply(`⛔ ${result.reason}`);
         }
 
-        return ctx.reply('✅ Запрошення прийнято! Оберіть дію на клавіатурі нижче:', mainKeyboard());
+        await notifyAdminsNewMember(ctx.from);
+        return ctx.reply('✅ Запрошення прийнято! Оберіть дію:', mainKeyboard(ctx.from.id));
     }
 
     if (!isAllowed(ctx.from.id)) {
         return denyAccess(ctx);
     }
 
+    addMember(ctx.from);
+
     const hint = isAdmin(ctx.from.id)
-        ? '\n\nАдмін-команди:\n/invite — створити запрошення\n/users — список користувачів\n/kick <id> — забрати доступ'
+        ? '\n\nКнопка «🎟️ Інвайт» — створити посилання\n/users — список\n/kick <id> — забрати доступ'
         : '';
 
-    return ctx.reply(`Привіт! Оберіть дію на клавіатурі нижче:${hint}`, mainKeyboard());
+    return ctx.reply(`Привіт! Оберіть дію на клавіатурі нижче:${hint}`, mainKeyboard(ctx.from.id));
 });
 
 bot.command('invite', async (ctx) => {
     if (!isAdmin(ctx.from.id)) {
-        return ctx.reply('⛔ Лише адмін може створювати запрошення.');
+        return ctx.reply('⛔ Лише адмін.');
     }
+    return sendInviteLink(ctx);
+});
 
-    const code = createInvite(ctx.from.id);
-    if (!botUsername) {
-        const me = await bot.telegram.getMe();
-        botUsername = me.username;
+bot.hears('🎟️ Інвайт', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        return denyAccess(ctx);
     }
-
-    const link = `https://t.me/${botUsername}?start=${code}`;
-    return ctx.reply(
-        `🎟️ Одноразове запрошення:\n\`${code}\`\n\nПосилання:\n${link}`,
-        { parse_mode: 'Markdown' }
-    );
+    return sendInviteLink(ctx);
 });
 
 bot.command('users', async (ctx) => {
@@ -505,16 +617,22 @@ bot.command('users', async (ctx) => {
     }
 
     access = loadAccess();
-    if (access.users.length === 0) {
-        return ctx.reply('Список користувачів порожній.');
-    }
-
-    const lines = access.users.map((u, i) => {
-        const uname = u.username ? `@${u.username}` : u.name || '—';
-        return `${i + 1}. ${uname} — \`${u.id}\` (${u.role || 'member'})`;
+    const ids = allowedUserIds();
+    const lines = ids.map((id, i) => {
+        const fromFile = access.users.find((u) => Number(u.id) === id);
+        const uname = fromFile
+            ? (fromFile.username ? `@${fromFile.username}` : fromFile.name || '—')
+            : '—';
+        const role = isAdmin(id) ? 'admin' : MEMBER_IDS.includes(id) ? 'member(env)' : (fromFile?.role || 'member');
+        return `${i + 1}. ${uname} — \`${id}\` (${role})`;
     });
 
-    return ctx.reply(`👥 Користувачі:\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+    const memberEnv = recommendedMemberIdsEnv();
+    return ctx.reply(
+        `👥 Користувачі:\n${lines.join('\n')}\n\n` +
+        `MEMBER_IDS для Render:\n\`MEMBER_IDS=${memberEnv || '(поки порожньо)'}\``,
+        { parse_mode: 'Markdown' }
+    );
 });
 
 bot.command('kick', async (ctx) => {
@@ -536,11 +654,17 @@ bot.command('kick', async (ctx) => {
     access.users = access.users.filter((u) => Number(u.id) !== targetId);
     saveAccess(access);
 
-    if (access.users.length === before) {
+    const stillInEnv = MEMBER_IDS.includes(targetId);
+    if (access.users.length === before && !stillInEnv) {
         return ctx.reply('Користувача не знайдено.');
     }
 
-    return ctx.reply(`🗑️ Доступ для \`${targetId}\` скасовано.`, { parse_mode: 'Markdown' });
+    let text = `🗑️ Доступ для \`${targetId}\` прибрано з файлу.`;
+    if (stillInEnv) {
+        text += `\n⚠️ Він ще в \`MEMBER_IDS\` — прибери ID з env на Render.`;
+    }
+
+    return ctx.reply(text, { parse_mode: 'Markdown' });
 });
 
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
