@@ -16,8 +16,13 @@ const TUYA_SECRET = process.env.TUYA_SECRET;
 const DEVICE_ID = process.env.TUYA_DEVICE_ID;
 const REGION = process.env.TUYA_REGION || 'eu';
 
-// Група відключень YASNO / ДТЕК (наприклад: '1', '2', '3', '4', '5', '6')
-const YASNO_GROUP = process.env.YASNO_GROUP || '1';
+// Адреса для графіка YASNO (Київ)
+const YASNO_REGION_ID = 25;
+const YASNO_DSO_ID = 902;
+const YASNO_STREET = process.env.YASNO_STREET || 'вул. Ахматової Анни';
+const YASNO_HOUSE = process.env.YASNO_HOUSE || '13Д';
+const YASNO_ADDRESS_LABEL = process.env.YASNO_ADDRESS_LABEL || 'вул. Анни Ахматової, 13Д';
+const YASNO_API = 'https://app.yasno.ua/api/blackout-service/public';
 
 const bot = new Telegraf(TOKEN);
 const app = express();
@@ -25,6 +30,12 @@ const app = express();
 app.use(express.json());
 
 let lastYasnoHash = null;
+let cachedYasnoGroup = null;
+
+const YASNO_HEADERS = {
+    Accept: 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+};
 
 // Перевірка статусу розетки Atorch через Tuya API
 async function getAtorchStatus() {
@@ -59,45 +70,173 @@ async function getAtorchStatus() {
     }
 }
 
-// Отримання графіка через джерело/API ДТЕК (на основі напрацювань dtek-schedule)
+function minutesToTime(minutes) {
+    const total = Math.max(0, Math.min(1440, Number(minutes) || 0));
+    const hh = Math.floor(total / 60) % 24;
+    const mm = total % 60;
+    if (total === 1440) return '24:00';
+    return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+function formatDayDate(isoDate) {
+    if (!isoDate) return '';
+    const d = new Date(isoDate);
+    return d.toLocaleDateString('uk-UA', {
+        weekday: 'long',
+        day: '2-digit',
+        month: '2-digit',
+        timeZone: 'Europe/Kyiv'
+    });
+}
+
+function formatUpdatedOn(isoDate) {
+    if (!isoDate) return '';
+    return new Date(isoDate).toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
+}
+
+function statusLabel(status) {
+    switch (status) {
+        case 'EmergencyShutdowns':
+            return '⚠️ Зараз аварійні відключення (плановий графік може не діяти)';
+        case 'WaitingForSchedule':
+            return '⏳ Графік очікує підтвердження / може змінитись';
+        case 'ScheduleApplies':
+            return '✅ Діє підтверджений графік';
+        default:
+            return status ? `ℹ️ Статус: ${status}` : '';
+    }
+}
+
+function formatSlots(slots) {
+    if (!Array.isArray(slots) || slots.length === 0) {
+        return 'Немає опублікованих слотів.';
+    }
+
+    const outages = slots.filter((s) => {
+        const type = String(s.type || '').toLowerCase();
+        return type.includes('definite') || type.includes('outage');
+    });
+
+    if (outages.length === 0) {
+        return '🟢 Відключень за графіком немає.';
+    }
+
+    // Зливаємо сусідні інтервали відключень
+    const sorted = outages
+        .map((s) => ({ start: Number(s.start), end: Number(s.end) }))
+        .sort((a, b) => a.start - b.start);
+
+    const merged = [];
+    for (const slot of sorted) {
+        const last = merged[merged.length - 1];
+        if (last && slot.start <= last.end) {
+            last.end = Math.max(last.end, slot.end);
+        } else {
+            merged.push({ ...slot });
+        }
+    }
+
+    return merged
+        .map((s) => `🔴 ${minutesToTime(s.start)} – ${minutesToTime(s.end)}`)
+        .join('\n');
+}
+
+function formatDayBlock(title, day) {
+    if (!day) return `*${title}:*\nДані відсутні.`;
+
+    const lines = [
+        `*${title}* (${formatDayDate(day.date)})`,
+        statusLabel(day.status)
+    ].filter(Boolean);
+
+    if (day.status === 'EmergencyShutdowns' && (!day.slots || day.slots.length === 0)) {
+        lines.push('Планові інтервали не опубліковані.');
+    } else {
+        lines.push(formatSlots(day.slots));
+    }
+
+    return lines.join('\n');
+}
+
+async function yasnoGet(path) {
+    const response = await fetch(`${YASNO_API}${path}`, { headers: YASNO_HEADERS });
+    if (!response.ok) {
+        throw new Error(`YASNO HTTP ${response.status} for ${path}`);
+    }
+    return response.json();
+}
+
+async function resolveYasnoGroup() {
+    if (cachedYasnoGroup) return cachedYasnoGroup;
+
+    const streetQuery = YASNO_STREET.replace(/^вул\.\s*/i, '').split(/\s+/)[0] || YASNO_STREET;
+    const streets = await yasnoGet(
+        `/shutdowns/addresses/v2/streets?regionId=${YASNO_REGION_ID}&dsoId=${YASNO_DSO_ID}&query=${encodeURIComponent(streetQuery)}`
+    );
+    const street = (streets || []).find((s) =>
+        String(s.value).toLowerCase().includes(streetQuery.toLowerCase())
+    ) || (streets || [])[0];
+
+    if (!street) {
+        throw new Error('Street not found');
+    }
+
+    const houses = await yasnoGet(
+        `/shutdowns/addresses/v2/houses?regionId=${YASNO_REGION_ID}&dsoId=${YASNO_DSO_ID}&streetId=${street.id}&query=${encodeURIComponent(YASNO_HOUSE)}`
+    );
+    const house = (houses || []).find((h) =>
+        String(h.value).toLowerCase() === String(YASNO_HOUSE).toLowerCase()
+    ) || (houses || []).find((h) =>
+        String(h.value).toLowerCase().startsWith(String(YASNO_HOUSE).toLowerCase())
+    );
+
+    if (!house) {
+        throw new Error('House not found');
+    }
+
+    const groupInfo = await yasnoGet(
+        `/shutdowns/addresses/v2/group?regionId=${YASNO_REGION_ID}&dsoId=${YASNO_DSO_ID}&streetId=${street.id}&houseId=${house.id}`
+    );
+
+    cachedYasnoGroup = `${groupInfo.group}.${groupInfo.subgroup}`;
+    return cachedYasnoGroup;
+}
+
+// Отримання графіка через публічний API YASNO за адресою
 async function getYasnoSchedule() {
     try {
-        // Запит до публічного ендпоінта графіків ДТЕК/Київські електромережі
-        const response = await fetch(`https://www.dtek-kem.com.ua/ua/ajax`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'X-Requested-With': 'XMLHttpRequest',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-            },
-            body: `city=kyiv&group=${YASNO_GROUP}`
-        });
+        const group = await resolveYasnoGroup();
+        const data = await yasnoGet(
+            `/shutdowns/regions/${YASNO_REGION_ID}/dsos/${YASNO_DSO_ID}/planned-outages`
+        );
 
-        if (!response.ok) {
-            return { text: '⚠️ Не вдалося отримати графік від ДТЕК.', hash: null };
+        const groupData = data[group];
+        if (!groupData) {
+            return {
+                text: `⚠️ Групу ${group} не знайдено в графіку YASNO.`,
+                hash: null
+            };
         }
 
-        const data = await response.json();
-        const rawString = JSON.stringify(data);
+        const rawString = JSON.stringify(groupData);
         const currentHash = crypto.createHash('md5').update(rawString).digest('hex');
 
-        let text = `📅 **Графік відключень (Група ${YASNO_GROUP}):**\n📍 *Адреса:* вул. Анни Ахматової, 13Д\n\n`;
+        let text =
+            `📅 *Графік відключень YASNO*\n` +
+            `📍 *Адреса:* ${YASNO_ADDRESS_LABEL}\n` +
+            `🔢 *Група:* ${group}\n\n` +
+            `${formatDayBlock('Сьогодні', groupData.today)}\n\n` +
+            `${formatDayBlock('Завтра', groupData.tomorrow)}`;
 
-        // Якщо сервер повернув HTML-розвітку або масив годин
-        if (data.pages && typeof data.pages === 'string') {
-            // Очищаємо базові HTML теги для зручного читання в Telegram, якщо це верстка
-            text += data.pages.replace(/<[^>]*>?/gm, '');
-        } else if (data.content) {
-            text += data.content.replace(/<[^>]*>?/gm, '');
-        } else {
-            text += `ℹ️ Графік оновлено, але форматується через веб-сайт. Переглянь деталі нижче.`;
+        if (groupData.updatedOn) {
+            text += `\n\n🕒 Оновлено: ${formatUpdatedOn(groupData.updatedOn)}`;
         }
 
-        return { text: text.slice(0, 4000), hash: currentHash };
-
+        return { text: text.slice(0, 4000), hash: currentHash, group };
     } catch (error) {
-        console.error('Помилка отримання графіка ДТЕК:', error);
-        return { text: '❌ Помилка з\'єднання з сервером графіків ДТЕК.', hash: null };
+        console.error('Помилка отримання графіка YASNO:', error);
+        cachedYasnoGroup = null;
+        return { text: '❌ Помилка з\'єднання з сервером графіків YASNO.', hash: null };
     }
 }
 
@@ -114,7 +253,7 @@ setInterval(async () => {
 
         if (result.hash !== lastYasnoHash) {
             lastYasnoHash = result.hash;
-            const notificationText = `🔔 **Увага! Оновлено графік відключень для Ахматової, 13Д!**\n\n${result.text}`;
+            const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
 
             for (const userId of ALLOWED_USERS) {
                 await bot.telegram.sendMessage(userId, notificationText, { parse_mode: 'Markdown' }).catch((err) => {
@@ -172,7 +311,7 @@ bot.hears('📅 Графік YASNO', async (ctx) => {
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
     const inlineKeyboard = Markup.inlineKeyboard([
-        [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://yasno.com.ua/ru/schedule-kyiv')]
+        [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://www.yasno.ua/schedule')]
     ]);
 
     ctx.reply(result.text, {
