@@ -39,7 +39,6 @@ app.use(express.json());
 
 let lastYasnoHash = null;
 let cachedYasnoGroup = null;
-let lastPowerStatus = null;
 let botUsername = null;
 
 function defaultAccess() {
@@ -397,29 +396,9 @@ async function getYasnoSchedule() {
     }
 }
 
-// Фонова перевірка (статус розетки кожні 2 хвилини + оновлення YASNO)
+// Фонова перевірка лише графіка YASNO (без Tuya — економимо квоту API)
 setInterval(async () => {
     try {
-        const power = await getSmartLifeStatus();
-        // Не вважаємо помилку API відключенням світла
-        if (power.error || power.online === null) {
-            console.error('Пропуск сповіщення про світло:', power.error);
-        } else {
-            if (lastPowerStatus !== null && lastPowerStatus !== power.online) {
-                lastPowerStatus = power.online;
-                const alertText = power.online
-                    ? '🟢 *Світло зʼявилося!*'
-                    : '🔴 *Світло зникло!*';
-
-                for (const userId of allowedUserIds()) {
-                    await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
-                }
-            }
-            if (lastPowerStatus === null) {
-                lastPowerStatus = power.online;
-            }
-        }
-
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
@@ -439,7 +418,7 @@ setInterval(async () => {
             }
         }
     } catch (e) {
-        console.error('Помилка у фоновій перевірці:', e);
+        console.error('Помилка у фоновій перевірці YASNO:', e);
     }
 }, 2 * 60 * 1000);
 
@@ -452,6 +431,7 @@ async function replyLightStatus(ctx) {
     if (power.error || power.online === null) {
         return ctx.reply(`⚠️ Не вдалося перевірити розетку:\n${power.error || 'невідома помилка'}`);
     }
+
     if (power.online) {
         return ctx.reply('🟢 Світло є!');
     }
