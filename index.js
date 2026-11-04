@@ -13,7 +13,7 @@ const ALLOWED_USERS = [350523892];
 
 // Домашня IP-адреса роутера та порт для перевірки
 const HOME_HOST = process.env.HOME_HOST || '85.114.199.189';
-const HOME_PORT = Number(process.env.HOME_PORT) || 80; // Порт для TCP-перевірки
+const HOME_PORT = Number(process.env.HOME_PORT) || 80;
 
 // Адреса для графіка YASNO (Київ, вул. Анни Ахматової, 13Д)
 const YASNO_REGION_ID = 25;
@@ -30,7 +30,7 @@ app.use(express.json());
 
 let lastYasnoHash = null;
 let cachedYasnoGroup = null;
-let lastPowerStatus = null; // Для відстеження зміни стану світла
+let lastPowerStatus = null;
 
 const YASNO_HEADERS = {
     Accept: 'application/json',
@@ -43,7 +43,7 @@ function checkHomeTcp() {
         const socket = new net.Socket();
         let isAlive = false;
 
-        socket.setTimeout(3000); // Таймаут 3 секунди
+        socket.setTimeout(3000);
 
         socket.on('connect', () => {
             isAlive = true;
@@ -51,7 +51,6 @@ function checkHomeTcp() {
         });
 
         socket.on('error', (err) => {
-            // ECONNREFUSED означає, що IP доступний і роутер у мережі (просто порт закритий)
             if (err.code === 'ECONNREFUSED' || err.code === 'EHOSTUNREACH') {
                 isAlive = true;
             }
@@ -201,7 +200,6 @@ async function resolveYasnoGroup() {
     return cachedYasnoGroup;
 }
 
-// Отримання графіка через публічний API YASNO за адресою
 async function getYasnoSchedule() {
     try {
         const group = await resolveYasnoGroup();
@@ -239,16 +237,14 @@ async function getYasnoSchedule() {
     }
 }
 
-// Фонова перевірка (TCP-перевірка кожні 2 хвилини + оновлення YASNO)
 setInterval(async () => {
     try {
-        // 1. Моніторинг світла через TCP
         const isOnline = await checkHomeTcp();
         if (lastPowerStatus !== null && lastPowerStatus !== isOnline) {
             lastPowerStatus = isOnline;
             const alertText = isOnline
-                ? '🟢 *Світло зʼявилося!*'
-                : '🔴 *Світло зникло!*';
+                ? '🟢 *Світло зʼявилося!* (Роутер на звʼязку)'
+                : '🔴 *Світло зникло!* (Роутер не відповідає)';
 
             for (const userId of ALLOWED_USERS) {
                 await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
@@ -258,7 +254,6 @@ setInterval(async () => {
             lastPowerStatus = isOnline;
         }
 
-        // 2. Перевірка оновлень графіків YASNO
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
@@ -282,7 +277,6 @@ setInterval(async () => {
     }
 }, 2 * 60 * 1000);
 
-// Команда /start
 bot.start((ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ Вибачте, цей бот приватний.');
@@ -297,7 +291,6 @@ bot.start((ctx) => {
     );
 });
 
-// Кнопка перевірки світла через TCP
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
@@ -315,7 +308,6 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     }
 });
 
-// Кнопка перегляду графіка
 bot.hears('📅 Графік YASNO', async (ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
