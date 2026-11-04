@@ -39,9 +39,13 @@ const YASNO_HEADERS = {
 };
 
 // Перевірка статусу розетки Smart Life / Tuya API
-// Отримання токена доступу Tuya API та перевірка статусу розетки
+// Повертає { online: boolean|null, error: string|null }
 async function getSmartLifeStatus() {
     try {
+        if (!TUYA_CLIENT_ID || !TUYA_SECRET) {
+            return { online: null, error: 'Не задані TUYA_CLIENT_ID / TUYA_SECRET' };
+        }
+
         const t = Date.now().toString();
         const clientId = TUYA_CLIENT_ID;
         const secret = TUYA_SECRET;
@@ -65,7 +69,7 @@ async function getSmartLifeStatus() {
         const tokenData = await tokenResponse.json();
         if (!tokenData.success || !tokenData.result) {
             console.error('Помилка отримання Tuya Token:', tokenData);
-            return false;
+            return { online: null, error: tokenData.msg || 'Не вдалося отримати Tuya token' };
         }
 
         const accessToken = tokenData.result.access_token;
@@ -90,13 +94,22 @@ async function getSmartLifeStatus() {
 
         const deviceData = await deviceResponse.json();
         if (deviceData.success && deviceData.result) {
-            return deviceData.result.online; // true, якщо розетка в мережі
+            return { online: Boolean(deviceData.result.online), error: null };
         }
 
-        return false;
+        console.error('Помилка статусу пристрою Tuya:', deviceData);
+        const apiMsg = deviceData.msg || 'Невідома помилка Tuya API';
+        // Типова причина: у проєкті Tuya не підписано IoT Core
+        if (String(apiMsg).toLowerCase().includes('iot core')) {
+            return {
+                online: null,
+                error: 'У Tuya Cloud не підписано IoT Core. Відкрий Cloud → Project → Service API → Subscribe «IoT Core».'
+            };
+        }
+        return { online: null, error: apiMsg };
     } catch (error) {
         console.error('Помилка запиту до Smart Life (Tuya):', error);
-        return false;
+        return { online: null, error: error.message || 'Помилка зʼєднання з Tuya' };
     }
 }
 
@@ -271,19 +284,24 @@ async function getYasnoSchedule() {
 // Фонова перевірка (статус розетки кожні 2 хвилини + оновлення YASNO)
 setInterval(async () => {
     try {
-        const isOnline = await getSmartLifeStatus();
-        if (lastPowerStatus !== null && lastPowerStatus !== isOnline) {
-            lastPowerStatus = isOnline;
-            const alertText = isOnline
-                ? '🟢 *Світло зʼявилося!*'
-                : '🔴 *Світло зникло!*';
+        const power = await getSmartLifeStatus();
+        // Не вважаємо помилку API відключенням світла
+        if (power.error || power.online === null) {
+            console.error('Пропуск сповіщення про світло:', power.error);
+        } else {
+            if (lastPowerStatus !== null && lastPowerStatus !== power.online) {
+                lastPowerStatus = power.online;
+                const alertText = power.online
+                    ? '🟢 *Світло зʼявилося!*'
+                    : '🔴 *Світло зникло!*';
 
-            for (const userId of ALLOWED_USERS) {
-                await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
+                for (const userId of ALLOWED_USERS) {
+                    await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
+                }
             }
-        }
-        if (lastPowerStatus === null) {
-            lastPowerStatus = isOnline;
+            if (lastPowerStatus === null) {
+                lastPowerStatus = power.online;
+            }
         }
 
         const result = await getYasnoSchedule();
@@ -329,11 +347,13 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     }
 
     const loadingMsg = await ctx.reply("⏳ Перевіряю стан розетки...");
-    const isOnline = await getSmartLifeStatus();
+    const power = await getSmartLifeStatus();
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
-    if (isOnline) {
+    if (power.error || power.online === null) {
+        ctx.reply(`⚠️ Не вдалося перевірити розетку:\n${power.error || 'невідома помилка'}`);
+    } else if (power.online) {
         ctx.reply('🟢 Світло є! (Розетка на звʼязку)');
     } else {
         ctx.reply('🔴 Світла немає! (Розетка офлайн)');
