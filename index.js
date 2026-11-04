@@ -822,6 +822,9 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, async () => {
     console.log(`Server is running on port ${PORT}`);
+
+    // Спочатку швидко піднімаємо HTTP, важке — після listen,
+    // щоб перший запит після сну Render встиг обробитись.
     try {
         const me = await bot.telegram.getMe();
         botUsername = me.username;
@@ -832,12 +835,19 @@ app.listen(PORT, async () => {
 
     if (WEBHOOK_URL) {
         try {
-            await bot.telegram.setWebhook(`${WEBHOOK_URL}${webhookPath}`, {
-                drop_pending_updates: true
-            });
-            console.log(`Webhook set to ${WEBHOOK_URL}${webhookPath}`);
+            const wantUrl = `${WEBHOOK_URL}${webhookPath}`;
+            const info = await bot.telegram.getWebhookInfo();
+
+            // Не викликаємо drop_pending_updates при кожному прокиданні —
+            // інакше Telegram втрачає перше повідомлення, яке розбудило сервер.
+            if (!info.url || info.url !== wantUrl) {
+                await bot.telegram.setWebhook(wantUrl);
+                console.log(`Webhook set to ${wantUrl}`);
+            } else {
+                console.log(`Webhook already set: ${info.url}`);
+            }
         } catch (error) {
-            console.error('Не вдалося встановити webhook:', error);
+            console.error('Не вдалося перевірити/встановити webhook:', error);
         }
     } else {
         console.warn('RENDER_EXTERNAL_URL не задано — webhook не встановлено');
