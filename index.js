@@ -311,7 +311,7 @@ bot.hears('📅 Графік YASNO', async (ctx) => {
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
 
     const inlineKeyboard = Markup.inlineKeyboard([
-        [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://www.yasno.ua/schedule')]
+        [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://static.yasno.ua/kyiv/outages')]
     ]);
 
     ctx.reply(result.text, {
