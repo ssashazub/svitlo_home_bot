@@ -109,11 +109,27 @@ function denyAccess(ctx) {
     return ctx.reply('⛔ Бот лише за запрошенням. Попроси у власника інвайт-посилання.');
 }
 
-function mainKeyboard() {
+function adminKeyboard() {
     return Markup.keyboard([
         ['💡 Перевірити світло вдома'],
         ['📅 Графік YASNO']
     ]).resize();
+}
+
+function memberButtons() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('💡 Перевірити світло вдома', 'check_light')],
+        [Markup.button.callback('📅 Графік YASNO', 'yasno_schedule')]
+    ]);
+}
+
+async function sendWelcome(ctx, text) {
+    if (isAdmin(ctx.from.id)) {
+        return ctx.reply(text, adminKeyboard());
+    }
+    // Reply-клавіатуру треба зняти окремим повідомленням — Telegram не міксує її з inline
+    await ctx.reply('✅ Доступ активний.', Markup.removeKeyboard());
+    return ctx.reply(text, memberButtons());
 }
 
 function createInvite(createdBy) {
@@ -443,12 +459,43 @@ setInterval(async () => {
     }
 }, 2 * 60 * 1000);
 
+async function replyLightStatus(ctx) {
+    const loadingMsg = await ctx.reply('⏳ Перевіряю стан розетки...');
+    const power = await getSmartLifeStatus();
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+    if (power.error || power.online === null) {
+        return ctx.reply(`⚠️ Не вдалося перевірити розетку:\n${power.error || 'невідома помилка'}`);
+    }
+    if (power.online) {
+        return ctx.reply('🟢 Світло є!');
+    }
+    return ctx.reply('🔴 Світла немає!');
+}
+
+async function replyYasnoSchedule(ctx) {
+    const loadingMsg = await ctx.reply('⏳ Завантажую графік для Ахматової, 13Д...');
+    const result = await getYasnoSchedule();
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+
+    const inlineKeyboard = Markup.inlineKeyboard([
+        [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://static.yasno.ua/kyiv/outages')]
+    ]);
+
+    return ctx.reply(result.text, {
+        parse_mode: 'Markdown',
+        ...inlineKeyboard
+    });
+}
+
 bot.start(async (ctx) => {
     const payload = (ctx.startPayload || '').trim();
 
     if (payload) {
         if (isAllowed(ctx.from.id)) {
-            return ctx.reply('✅ У вас уже є доступ.', mainKeyboard());
+            return sendWelcome(ctx, 'Оберіть дію:');
         }
 
         const result = redeemInvite(payload, ctx.from);
@@ -456,24 +503,21 @@ bot.start(async (ctx) => {
             return ctx.reply(`⛔ ${result.reason}`);
         }
 
-        return ctx.reply(
-            '✅ Запрошення прийнято! Оберіть дію на клавіатурі нижче:',
-            mainKeyboard()
-        );
+        return sendWelcome(ctx, '✅ Запрошення прийнято! Оберіть дію:');
     }
 
     if (!isAllowed(ctx.from.id)) {
         return denyAccess(ctx);
     }
 
-    const hint = isAdmin(ctx.from.id)
-        ? '\n\nАдмін-команди:\n/invite — створити запрошення\n/users — список користувачів\n/kick <id> — забрати доступ'
-        : '';
+    if (isAdmin(ctx.from.id)) {
+        return ctx.reply(
+            'Привіт! Оберіть дію на клавіатурі нижче:\n\nАдмін-команди:\n/invite — створити запрошення\n/users — список користувачів\n/kick <id> — забрати доступ',
+            adminKeyboard()
+        );
+    }
 
-    return ctx.reply(
-        `Привіт! Оберіть потрібну дію на клавіатурі нижче:${hint}`,
-        mainKeyboard()
-    );
+    return sendWelcome(ctx, 'Привіт! Оберіть дію:');
 });
 
 bot.command('invite', async (ctx) => {
@@ -538,43 +582,42 @@ bot.command('kick', async (ctx) => {
     return ctx.reply(`🗑️ Доступ для \`${targetId}\` скасовано.`, { parse_mode: 'Markdown' });
 });
 
+// Reply-клавіатура — лише для адміна
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
-    if (!isAllowed(ctx.from.id)) {
-        return denyAccess(ctx);
+    if (!isAdmin(ctx.from.id)) {
+        return ctx.reply('⛔ Користуйтесь кнопками під повідомленням.', memberButtons());
     }
-
-    const loadingMsg = await ctx.reply('⏳ Перевіряю стан розетки...');
-    const power = await getSmartLifeStatus();
-
-    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
-
-    if (power.error || power.online === null) {
-        ctx.reply(`⚠️ Не вдалося перевірити розетку:\n${power.error || 'невідома помилка'}`);
-    } else if (power.online) {
-        ctx.reply('🟢 Світло є!');
-    } else {
-        ctx.reply('🔴 Світла немає!');
-    }
+    return replyLightStatus(ctx);
 });
 
 bot.hears('📅 Графік YASNO', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        return ctx.reply('⛔ Користуйтесь кнопками під повідомленням.', memberButtons());
+    }
+    return replyYasnoSchedule(ctx);
+});
+
+bot.action('check_light', async (ctx) => {
     if (!isAllowed(ctx.from.id)) {
+        await ctx.answerCbQuery('Немає доступу');
         return denyAccess(ctx);
     }
+    await ctx.answerCbQuery();
+    return replyLightStatus(ctx);
+});
 
-    const loadingMsg = await ctx.reply('⏳ Завантажую графік для Ахматової, 13Д...');
-    const result = await getYasnoSchedule();
+bot.action('yasno_schedule', async (ctx) => {
+    if (!isAllowed(ctx.from.id)) {
+        await ctx.answerCbQuery('Немає доступу');
+        return denyAccess(ctx);
+    }
+    await ctx.answerCbQuery();
+    return replyYasnoSchedule(ctx);
+});
 
-    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
-
-    const inlineKeyboard = Markup.inlineKeyboard([
-        [Markup.button.url('🌐 Офіційна сторінка YASNO', 'https://static.yasno.ua/kyiv/outages')]
-    ]);
-
-    ctx.reply(result.text, {
-        parse_mode: 'Markdown',
-        ...inlineKeyboard
-    });
+bot.on(['sticker', 'voice', 'video_note'], async (ctx) => {
+    await ctx.deleteMessage().catch(() => {});
+    return ctx.reply('⛔ Стікери, голосові та кружки в цьому боті вимкнені.');
 });
 
 const PORT = process.env.PORT || 3000;
