@@ -1,14 +1,22 @@
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const fetch = require('node-fetch');
 
 // Токен твого бота та твій Telegram ID
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
 const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 
-// Список користувачів, яким дозволено користуватися ботом
-const ALLOWED_USERS = [350523892];
+// Адміни можуть створювати запрошення. Інші юзери — лише за інвайтом.
+const ADMIN_IDS = (process.env.ADMIN_IDS || '350523892')
+    .split(',')
+    .map((id) => Number(String(id).trim()))
+    .filter(Boolean);
+
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const ACCESS_FILE = path.join(DATA_DIR, 'access.json');
 
 // Дані Tuya / Smart Life (розетка "Напруга дома")
 const TUYA_CLIENT_ID = process.env.TUYA_CLIENT_ID;
@@ -32,6 +40,114 @@ app.use(express.json());
 let lastYasnoHash = null;
 let cachedYasnoGroup = null;
 let lastPowerStatus = null;
+let botUsername = null;
+
+function defaultAccess() {
+    return {
+        users: ADMIN_IDS.map((id) => ({
+            id,
+            name: 'admin',
+            role: 'admin',
+            joinedAt: new Date().toISOString()
+        })),
+        invites: {}
+    };
+}
+
+function loadAccess() {
+    try {
+        if (!fs.existsSync(ACCESS_FILE)) return defaultAccess();
+        const parsed = JSON.parse(fs.readFileSync(ACCESS_FILE, 'utf8'));
+        if (!parsed.users || !Array.isArray(parsed.users)) parsed.users = [];
+        if (!parsed.invites || typeof parsed.invites !== 'object') parsed.invites = {};
+
+        // Гарантуємо, що всі адміни завжди в списку
+        for (const adminId of ADMIN_IDS) {
+            if (!parsed.users.some((u) => Number(u.id) === adminId)) {
+                parsed.users.push({
+                    id: adminId,
+                    name: 'admin',
+                    role: 'admin',
+                    joinedAt: new Date().toISOString()
+                });
+            } else {
+                const user = parsed.users.find((u) => Number(u.id) === adminId);
+                user.role = 'admin';
+            }
+        }
+        return parsed;
+    } catch (error) {
+        console.error('Не вдалося прочитати access.json:', error);
+        return defaultAccess();
+    }
+}
+
+function saveAccess(access) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2));
+}
+
+let access = loadAccess();
+saveAccess(access);
+
+function isAdmin(userId) {
+    return ADMIN_IDS.includes(Number(userId));
+}
+
+function isAllowed(userId) {
+    const id = Number(userId);
+    return isAdmin(id) || access.users.some((u) => Number(u.id) === id);
+}
+
+function allowedUserIds() {
+    const ids = new Set(ADMIN_IDS);
+    for (const user of access.users) ids.add(Number(user.id));
+    return [...ids];
+}
+
+function denyAccess(ctx) {
+    return ctx.reply('⛔ Бот лише за запрошенням. Попроси у власника інвайт-посилання.');
+}
+
+function mainKeyboard() {
+    return Markup.keyboard([
+        ['💡 Перевірити світло вдома'],
+        ['📅 Графік YASNO']
+    ]).resize();
+}
+
+function createInvite(createdBy) {
+    const code = crypto.randomBytes(4).toString('hex');
+    access.invites[code] = {
+        createdBy: Number(createdBy),
+        createdAt: new Date().toISOString(),
+        usedBy: null
+    };
+    saveAccess(access);
+    return code;
+}
+
+function redeemInvite(code, from) {
+    const invite = access.invites[code];
+    if (!invite) return { ok: false, reason: 'Інвайт недійсний або вже використаний.' };
+    if (invite.usedBy) return { ok: false, reason: 'Цей інвайт уже використано.' };
+
+    invite.usedBy = Number(from.id);
+    invite.usedAt = new Date().toISOString();
+
+    if (!access.users.some((u) => Number(u.id) === Number(from.id))) {
+        access.users.push({
+            id: Number(from.id),
+            name: [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id),
+            username: from.username || null,
+            role: isAdmin(from.id) ? 'admin' : 'member',
+            joinedAt: new Date().toISOString()
+        });
+    }
+
+    saveAccess(access);
+    return { ok: true };
+}
 
 const YASNO_HEADERS = {
     Accept: 'application/json',
@@ -354,9 +470,9 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     if (power.error || power.online === null) {
         ctx.reply(`⚠️ Не вдалося перевірити розетку:\n${power.error || 'невідома помилка'}`);
     } else if (power.online) {
-        ctx.reply('🟢 Світло є! (Розетка на звʼязку)');
+        ctx.reply('🟢 Світло є!');
     } else {
-        ctx.reply('🔴 Світла немає! (Розетка офлайн)');
+        ctx.reply('🔴 Світла немає!');
     }
 });
 
