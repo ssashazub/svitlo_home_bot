@@ -61,8 +61,10 @@ async function getSmartLifeStatus() {
         });
 
         const data = await response.json();
+        console.log('Tuya API Response:', JSON.stringify(data)); // Выведем полный ответ в логи Render
+
         if (data.success && data.result) {
-            return data.result.online; // true, якщо розетка на зв'язку з хмарою
+            return data.result.online;
         }
         return false;
     } catch (error) {
