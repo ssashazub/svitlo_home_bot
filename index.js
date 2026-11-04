@@ -5,12 +5,12 @@ const fetch = require('node-fetch');
 
 // Токен твого бота та твій Telegram ID
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
-const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL; // Render підставить автоматично
+const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 
-// Список користувачів, яким дозволено користуватися ботом (твій ID)
+// Список користувачів, яким дозволено користуватися ботом
 const ALLOWED_USERS = [350523892];
 
-// Дані Tuya IoT (їх ти вкажеш у змінних середовища на Render.com)
+// Дані Tuya IoT
 const TUYA_CLIENT_ID = process.env.TUYA_CLIENT_ID;
 const TUYA_SECRET = process.env.TUYA_SECRET;
 const DEVICE_ID = process.env.TUYA_DEVICE_ID;
@@ -24,10 +24,9 @@ const app = express();
 
 app.use(express.json());
 
-// Змінна для збереження попереднього стану графіка (щоб відстежувати оновлення)
 let lastYasnoHash = null;
 
-// Функція запиту до Tuya Cloud API для перевірки статусу розетки Atorch
+// Функція перевірки статусу розетки Atorch
 async function getAtorchStatus() {
     try {
         const t = Date.now().toString();
@@ -60,53 +59,60 @@ async function getAtorchStatus() {
     }
 }
 
-// Форматування тексту графіка YASNO
-function formatYasnoData(data) {
-    if (data && data.group && data.group[YASNO_GROUP]) {
-        const groupSchedule = data.group[YASNO_GROUP];
-        let text = `📅 **Графік YASNO (Група ${YASNO_GROUP}):**\n\n`;
-
-        for (const [day, hours] of Object.entries(groupSchedule)) {
-            text += `🗓 **${day}**:\n`;
-            if (Array.isArray(hours) && hours.length > 0) {
-                hours.forEach(h => {
-                    text += `  • ${h.start} — ${h.end} (${h.type === 'DEFINITE_OUTAGE' ? '🔴 Відключення' : '🟡 Можливе відключення'})\n`;
-                });
-            } else {
-                text += `  ✅ Відключень не заплановано\n`;
-            }
-            text += `\n`;
-        }
-        return text;
-    }
-    return `ℹ️ Актуальних графіків відключень для Групи ${YASNO_GROUP} наразі немає або мережа працює без обмежень.`;
-}
-
-// Функція отримання графіка від YASNO
+// Функція парсингу та форматування графіків YASNO для Києва
 async function getYasnoSchedule() {
     try {
-        const response = await fetch('https://static.yasno.ua/kyiv/outages', {
+        // Використовуємо актуальний API endpoint YASNO для Києва
+        const response = await fetch(`https://yasno.com.ua/api/kyiv/outages?group=${YASNO_GROUP}`, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
             }
         });
 
         if (!response.ok) {
-            return { text: '⚠️ Не вдалося отримати дані від YASNO.', hash: null, raw: null };
+            return { text: '⚠️ Не вдалося отримати дані від YASNO. Спробуй пізніше.', hash: null };
         }
 
         const data = await response.json();
-        const rawString = JSON.stringify(data.group?.[YASNO_GROUP] || {});
+
+        // Перевіряємо структуру відповіді API YASNO
+        // Зазвичай структура містить масив днів або об'єкт із графіком
+        if (!data || !data.schedule) {
+            // Альтернативний формат перевірки структури, якщо дані прийшли інакше
+            const rawString = JSON.stringify(data);
+            const currentHash = crypto.createHash('md5').update(rawString).digest('hex');
+
+            return {
+                text: `📅 **Графік YASNO (Група ${YASNO_GROUP}):**\n\n\`\`\`json\n${JSON.stringify(data, null, 2).slice(0, 3500)}\n\`\`\``,
+                hash: currentHash
+            };
+        }
+
+        let text = `📅 **Графік відключень YASNO (Група ${YASNO_GROUP}):**\n\n`;
+
+        // Форматуємо дні та години з отриманого об'єкта
+        for (const dayItem of data.schedule) {
+            text += `🗓 **${dayItem.date || 'День'}**:\n`;
+            if (dayItem.slots && dayItem.slots.length > 0) {
+                dayItem.slots.forEach(slot => {
+                    const statusIcon = slot.type === 'outage' ? '🔴' : '🟡';
+                    text += `  • ${slot.start} — ${slot.end} (${statusIcon} ${slot.type === 'outage' ? 'Відключення' : 'Можливе відключення'})\n`;
+                });
+            } else {
+                text += `  ✅ Відключень за цим днем немає\n`;
+            }
+            text += `\n`;
+        }
+
+        const rawString = JSON.stringify(data);
         const currentHash = crypto.createHash('md5').update(rawString).digest('hex');
 
-        return {
-            text: formatYasnoData(data),
-            hash: currentHash,
-            raw: data
-        };
+        return { text, hash: currentHash };
+
     } catch (error) {
-        console.error('Помилка запиту до YASNO:', error);
-        return { text: '❌ Помилка під час отримання графіка YASNO.', hash: null, raw: null };
+        console.error('Помилка запиту до YASNO API:', error);
+        return { text: '❌ Помилка обробки графіка YASNO.', hash: null };
     }
 }
 
@@ -116,13 +122,11 @@ setInterval(async () => {
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
-        // Якщо це перша перевірка після запуску — просто запам'ятовуємо хеш
         if (lastYasnoHash === null) {
             lastYasnoHash = result.hash;
             return;
         }
 
-        // Якщо хеш змінився — графік оновився! Надсилаємо сповіщення всім дозволеним користувачам
         if (result.hash !== lastYasnoHash) {
             lastYasnoHash = result.hash;
             const notificationText = `🔔 **Увага! Оновлено графік відключень YASNO!**\n\n${result.text}`;
@@ -136,16 +140,16 @@ setInterval(async () => {
     } catch (e) {
         console.error('Помилка у фоновій перевірці YASNO:', e);
     }
-}, 10 * 60 * 1000); // 10 хвилин
+}, 10 * 60 * 1000);
 
-// Команда /start з перевіркою доступу
+// Команда /start
 bot.start((ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ Вибачте, цей бот приватний.');
     }
 
     ctx.reply(
-        'Привіт! Натисни кнопку нижче, щоб перевірити світло або дізнатися графік.',
+        'Привіт! Натисни кнопку нижче, щоб перевірити світло або переглянути графік.',
         Markup.keyboard([
             ['💡 Перевірити світло вдома'],
             ['📅 Графік YASNO']
@@ -153,7 +157,7 @@ bot.start((ctx) => {
     );
 });
 
-// Обробка натискання на кнопку перевірки світла
+// Перевірка світла через розетку
 bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
@@ -171,7 +175,7 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
     }
 });
 
-// Обробка натискання на кнопку графіків YASNO
+// Запит графіка по кнопці
 bot.hears('📅 Графік YASNO', async (ctx) => {
     if (!ALLOWED_USERS.includes(ctx.from.id)) {
         return ctx.reply('⛔ У вас немає доступу до цього бота.');
