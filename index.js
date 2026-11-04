@@ -411,7 +411,7 @@ setInterval(async () => {
                     ? '🟢 *Світло зʼявилося!*'
                     : '🔴 *Світло зникло!*';
 
-                for (const userId of ALLOWED_USERS) {
+                for (const userId of allowedUserIds()) {
                     await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
                 }
             }
@@ -432,7 +432,7 @@ setInterval(async () => {
             lastYasnoHash = result.hash;
             const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
 
-            for (const userId of ALLOWED_USERS) {
+            for (const userId of allowedUserIds()) {
                 await bot.telegram.sendMessage(userId, notificationText, { parse_mode: 'Markdown' }).catch((err) => {
                     console.error(`Не вдалося надіслати сповіщення користувачу ${userId}:`, err);
                 });
@@ -443,26 +443,107 @@ setInterval(async () => {
     }
 }, 2 * 60 * 1000);
 
-bot.start((ctx) => {
-    if (!ALLOWED_USERS.includes(ctx.from.id)) {
-        return ctx.reply('⛔ Вибачте, цей бот приватний.');
+bot.start(async (ctx) => {
+    const payload = (ctx.startPayload || '').trim();
+
+    if (payload) {
+        if (isAllowed(ctx.from.id)) {
+            return ctx.reply('✅ У вас уже є доступ.', mainKeyboard());
+        }
+
+        const result = redeemInvite(payload, ctx.from);
+        if (!result.ok) {
+            return ctx.reply(`⛔ ${result.reason}`);
+        }
+
+        return ctx.reply(
+            '✅ Запрошення прийнято! Оберіть дію на клавіатурі нижче:',
+            mainKeyboard()
+        );
     }
 
-    ctx.reply(
-        'Привіт! Оберіть потрібну дію на клавіатурі нижче:',
-        Markup.keyboard([
-            ['💡 Перевірити світло вдома'],
-            ['📅 Графік YASNO']
-        ]).resize()
+    if (!isAllowed(ctx.from.id)) {
+        return denyAccess(ctx);
+    }
+
+    const hint = isAdmin(ctx.from.id)
+        ? '\n\nАдмін-команди:\n/invite — створити запрошення\n/users — список користувачів\n/kick <id> — забрати доступ'
+        : '';
+
+    return ctx.reply(
+        `Привіт! Оберіть потрібну дію на клавіатурі нижче:${hint}`,
+        mainKeyboard()
     );
 });
 
-bot.hears('💡 Перевірити світло вдома', async (ctx) => {
-    if (!ALLOWED_USERS.includes(ctx.from.id)) {
-        return ctx.reply('⛔ У вас немає доступу до цього бота.');
+bot.command('invite', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        return ctx.reply('⛔ Лише адмін може створювати запрошення.');
     }
 
-    const loadingMsg = await ctx.reply("⏳ Перевіряю стан розетки...");
+    const code = createInvite(ctx.from.id);
+    if (!botUsername) {
+        const me = await bot.telegram.getMe();
+        botUsername = me.username;
+    }
+
+    const link = `https://t.me/${botUsername}?start=${code}`;
+    return ctx.reply(
+        `🎟️ Одноразове запрошення:\n\`${code}\`\n\nПосилання:\n${link}`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+bot.command('users', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        return ctx.reply('⛔ Лише адмін.');
+    }
+
+    access = loadAccess();
+    if (access.users.length === 0) {
+        return ctx.reply('Список користувачів порожній.');
+    }
+
+    const lines = access.users.map((u, i) => {
+        const uname = u.username ? `@${u.username}` : u.name || '—';
+        return `${i + 1}. ${uname} — \`${u.id}\` (${u.role || 'member'})`;
+    });
+
+    return ctx.reply(`👥 Користувачі:\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+});
+
+bot.command('kick', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) {
+        return ctx.reply('⛔ Лише адмін.');
+    }
+
+    const parts = (ctx.message.text || '').trim().split(/\s+/);
+    const targetId = Number(parts[1]);
+    if (!targetId) {
+        return ctx.reply('Використання: /kick <telegram_id>');
+    }
+    if (isAdmin(targetId)) {
+        return ctx.reply('⛔ Не можна видалити адміна.');
+    }
+
+    access = loadAccess();
+    const before = access.users.length;
+    access.users = access.users.filter((u) => Number(u.id) !== targetId);
+    saveAccess(access);
+
+    if (access.users.length === before) {
+        return ctx.reply('Користувача не знайдено.');
+    }
+
+    return ctx.reply(`🗑️ Доступ для \`${targetId}\` скасовано.`, { parse_mode: 'Markdown' });
+});
+
+bot.hears('💡 Перевірити світло вдома', async (ctx) => {
+    if (!isAllowed(ctx.from.id)) {
+        return denyAccess(ctx);
+    }
+
+    const loadingMsg = await ctx.reply('⏳ Перевіряю стан розетки...');
     const power = await getSmartLifeStatus();
 
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
@@ -477,8 +558,8 @@ bot.hears('💡 Перевірити світло вдома', async (ctx) => {
 });
 
 bot.hears('📅 Графік YASNO', async (ctx) => {
-    if (!ALLOWED_USERS.includes(ctx.from.id)) {
-        return ctx.reply('⛔ У вас немає доступу до цього бота.');
+    if (!isAllowed(ctx.from.id)) {
+        return denyAccess(ctx);
     }
 
     const loadingMsg = await ctx.reply('⏳ Завантажую графік для Ахматової, 13Д...');
@@ -506,6 +587,13 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, async () => {
     console.log(`Server is running on port ${PORT}`);
+    try {
+        const me = await bot.telegram.getMe();
+        botUsername = me.username;
+        console.log(`Bot @${botUsername}`);
+    } catch (error) {
+        console.error('Не вдалося отримати username бота:', error);
+    }
     if (WEBHOOK_URL) {
         await bot.telegram.setWebhook(`${WEBHOOK_URL}/bot${TOKEN}`);
         console.log(`Webhook set to ${WEBHOOK_URL}/bot${TOKEN}`);
