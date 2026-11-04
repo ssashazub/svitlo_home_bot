@@ -41,8 +41,6 @@ const YASNO_API = 'https://app.yasno.ua/api/blackout-service/public';
 const bot = new Telegraf(TOKEN);
 const app = express();
 
-app.use(express.json());
-
 let lastYasnoHash = null;
 let lastYasnoNotifyAt = 0;
 let yasnoCheckInProgress = false;
@@ -104,12 +102,25 @@ function loadAccess() {
 }
 
 function saveAccess(data) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(ACCESS_FILE, JSON.stringify(data, null, 2));
+    try {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        fs.writeFileSync(ACCESS_FILE, JSON.stringify(data, null, 2));
+        return true;
+    } catch (error) {
+        console.error('Не вдалося зберегти access.json:', error.message || error);
+        return false;
+    }
 }
 
 let access = loadAccess();
 saveAccess(access);
+
+bot.catch((err, ctx) => {
+    console.error('Telegraf error:', err);
+    if (ctx && ctx.reply) {
+        ctx.reply('⚠️ Сталася помилка. Спробуй ще раз через кілька секунд.').catch(() => {});
+    }
+});
 
 function isAdmin(userId) {
     return ADMIN_IDS.includes(Number(userId));
@@ -204,17 +215,26 @@ async function notifyAdminsNewMember(from) {
 }
 
 async function sendInviteLink(ctx) {
-    if (!botUsername) {
-        const me = await bot.telegram.getMe();
-        botUsername = me.username;
+    try {
+        if (!botUsername) {
+            const me = await bot.telegram.getMe();
+            botUsername = me.username;
+        }
+        if (!botUsername) {
+            return ctx.reply('⚠️ Не вдалося отримати username бота. Перевір, що в @BotFather задано username.');
+        }
+
+        const code = createInvite(ctx.from.id);
+        const link = `https://t.me/${botUsername}?start=${code}`;
+        // Без Markdown: інакше _ у username бота ламає повідомлення
+        return ctx.reply(
+            `🎟️ Одноразове запрошення:\n${code}\n\n${link}\n\n` +
+            `Після входу оновлю MEMBER_IDS у Render — і доступ не злетить після деплою.`
+        );
+    } catch (error) {
+        console.error('Помилка створення інвайту:', error);
+        return ctx.reply(`⚠️ Не вдалося створити інвайт: ${error.message || error}`);
     }
-    const code = createInvite(ctx.from.id);
-    const link = `https://t.me/${botUsername}?start=${code}`;
-    return ctx.reply(
-        `🎟️ Одноразове запрошення:\n\`${code}\`\n\n${link}\n\n` +
-        `Після входу оновлю MEMBER_IDS у Render — і доступ не злетить після деплою.`,
-        { parse_mode: 'Markdown' }
-    );
 }
 
 const YASNO_HEADERS = {
@@ -611,6 +631,10 @@ bot.hears('🎟️ Інвайт', async (ctx) => {
     return sendInviteLink(ctx);
 });
 
+bot.command('ping', async (ctx) => {
+    return ctx.reply('pong');
+});
+
 bot.command('users', async (ctx) => {
     if (!isAdmin(ctx.from.id)) {
         return ctx.reply('⛔ Лише адмін.');
@@ -687,8 +711,10 @@ bot.on(['sticker', 'voice', 'video_note'], async (ctx) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const webhookPath = `/bot${TOKEN}`;
 
-app.use(bot.webhookCallback(`/bot${TOKEN}`));
+// Не вішати express.json() перед webhook — ламає updates від Telegram
+app.use(bot.webhookCallback(webhookPath));
 
 app.get('/', (req, res) => {
     res.send('Smart Life / Atorch Telegram Bot is running!');
@@ -703,8 +729,17 @@ app.listen(PORT, async () => {
     } catch (error) {
         console.error('Не вдалося отримати username бота:', error);
     }
+
     if (WEBHOOK_URL) {
-        await bot.telegram.setWebhook(`${WEBHOOK_URL}/bot${TOKEN}`);
-        console.log(`Webhook set to ${WEBHOOK_URL}/bot${TOKEN}`);
+        try {
+            await bot.telegram.setWebhook(`${WEBHOOK_URL}${webhookPath}`, {
+                drop_pending_updates: true
+            });
+            console.log(`Webhook set to ${WEBHOOK_URL}${webhookPath}`);
+        } catch (error) {
+            console.error('Не вдалося встановити webhook:', error);
+        }
+    } else {
+        console.warn('RENDER_EXTERNAL_URL не задано — webhook не встановлено');
     }
 });
