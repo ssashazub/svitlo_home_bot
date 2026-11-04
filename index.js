@@ -39,18 +39,20 @@ const YASNO_HEADERS = {
 };
 
 // Перевірка статусу розетки Smart Life / Tuya API
+// Отримання токена доступу Tuya API та перевірка статусу розетки
 async function getSmartLifeStatus() {
     try {
         const t = Date.now().toString();
         const clientId = TUYA_CLIENT_ID;
         const secret = TUYA_SECRET;
 
-        const signUrl = `/v1.0/iot-03/devices/${DEVICE_ID}`;
+        // Крок 1: Отримуємо Access Token
+        const signUrl = `/v1.0/token?grant_type=1`;
         const stringToSign = `GET\n${crypto.createHash('sha256').update('').digest('hex')}\n\n${signUrl}`;
         const signStr = clientId + t + stringToSign;
         const sign = crypto.createHmac('sha256', secret).update(signStr).digest('hex').toUpperCase();
 
-        const response = await fetch(`https://openapi.tuya${REGION}.com${signUrl}`, {
+        const tokenResponse = await fetch(`https://openapi.tuya${REGION}.com${signUrl}`, {
             method: 'GET',
             headers: {
                 'client_id': clientId,
@@ -60,12 +62,37 @@ async function getSmartLifeStatus() {
             }
         });
 
-        const data = await response.json();
-        console.log('Tuya API Response:', JSON.stringify(data)); // Выведем полный ответ в логи Render
-
-        if (data.success && data.result) {
-            return data.result.online;
+        const tokenData = await tokenResponse.json();
+        if (!tokenData.success || !tokenData.result) {
+            console.error('Помилка отримання Tuya Token:', tokenData);
+            return false;
         }
+
+        const accessToken = tokenData.result.access_token;
+
+        // Крок 2: Запитуємо статус пристрою за допомогою отриманого токена
+        const deviceUrl = `/v1.0/iot-03/devices/${DEVICE_ID}`;
+        const t2 = Date.now().toString();
+        const stringToSignDevice = `GET\n${crypto.createHash('sha256').update('').digest('hex')}\n\n${deviceUrl}`;
+        const signStrDevice = clientId + accessToken + t2 + stringToSignDevice;
+        const signDevice = crypto.createHmac('sha256', secret).update(signStrDevice).digest('hex').toUpperCase();
+
+        const deviceResponse = await fetch(`https://openapi.tuya${REGION}.com${deviceUrl}`, {
+            method: 'GET',
+            headers: {
+                'client_id': clientId,
+                'access_token': accessToken,
+                't': t2,
+                'sign': signDevice,
+                'sign_method': 'HMAC-SHA256'
+            }
+        });
+
+        const deviceData = await deviceResponse.json();
+        if (deviceData.success && deviceData.result) {
+            return deviceData.result.online; // true, якщо розетка в мережі
+        }
+
         return false;
     } catch (error) {
         console.error('Помилка запиту до Smart Life (Tuya):', error);
@@ -248,8 +275,8 @@ setInterval(async () => {
         if (lastPowerStatus !== null && lastPowerStatus !== isOnline) {
             lastPowerStatus = isOnline;
             const alertText = isOnline
-                ? '🟢 *Світло зʼявилося!* (Розетка в мережі)'
-                : '🔴 *Світло зникло!* (Розетка офлайн)';
+                ? '🟢 *Світло зʼявилося!*'
+                : '🔴 *Світло зникло!*';
 
             for (const userId of ALLOWED_USERS) {
                 await bot.telegram.sendMessage(userId, alertText, { parse_mode: 'Markdown' }).catch(() => {});
