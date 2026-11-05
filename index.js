@@ -7,7 +7,7 @@ const fetch = require('node-fetch');
 const { startTuyaPulsar } = require('./tuyaPulsar');
 
 // Токен твого бота та твій Telegram ID
-const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
+const TOKEN = "9162787820:AAHa3aQ5tAVQAFVSk3aYGOALqhTh9dxH8rE";
 const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL;
 
 // Адміни керують інвайтами. Доступ — лише за запрошенням.
