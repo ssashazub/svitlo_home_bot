@@ -51,13 +51,21 @@ function loadYasnoState() {
             return {
                 lastHash: parsed.lastHash || null,
                 lastNotifiedHash: parsed.lastNotifiedHash || null,
+                lastUpdatedOn: parsed.lastUpdatedOn || null,
+                lastNotifiedUpdatedOn: parsed.lastNotifiedUpdatedOn || null,
                 lastNotifyAt: Number(parsed.lastNotifyAt) || 0
             };
         }
     } catch (error) {
         console.error('Не вдалося прочитати yasno-state.json:', error.message || error);
     }
-    return { lastHash: null, lastNotifiedHash: null, lastNotifyAt: 0 };
+    return {
+        lastHash: null,
+        lastNotifiedHash: null,
+        lastUpdatedOn: null,
+        lastNotifiedUpdatedOn: null,
+        lastNotifyAt: 0
+    };
 }
 
 function saveYasnoState(state) {
@@ -69,9 +77,55 @@ function saveYasnoState(state) {
     }
 }
 
+function yasnoStateSnapshot() {
+    return {
+        lastHash: lastYasnoHash,
+        lastNotifiedHash: lastYasnoNotifiedHash,
+        lastUpdatedOn: lastYasnoUpdatedOn,
+        lastNotifiedUpdatedOn: lastYasnoNotifiedUpdatedOn,
+        lastNotifyAt: lastYasnoNotifyAt
+    };
+}
+
+function persistYasnoState() {
+    saveYasnoState(yasnoStateSnapshot());
+}
+
+/** Зливає диск + пам'ять: cooldown/updatedOn ніколи не відкочуються назад у межах процесу. */
+function mergeYasnoStateFromDisk() {
+    const disk = loadYasnoState();
+    const diskNotifyAt = Number(disk.lastNotifyAt) || 0;
+    const memNotifyAt = Number(lastYasnoNotifyAt) || 0;
+
+    if (diskNotifyAt > memNotifyAt) {
+        lastYasnoNotifyAt = diskNotifyAt;
+        lastYasnoHash = disk.lastHash || lastYasnoHash;
+        lastYasnoNotifiedHash = disk.lastNotifiedHash || lastYasnoNotifiedHash;
+        lastYasnoUpdatedOn = disk.lastUpdatedOn || lastYasnoUpdatedOn;
+        lastYasnoNotifiedUpdatedOn = disk.lastNotifiedUpdatedOn || lastYasnoNotifiedUpdatedOn;
+        return;
+    }
+
+    if (diskNotifyAt === memNotifyAt) {
+        lastYasnoHash = disk.lastHash || lastYasnoHash;
+        lastYasnoNotifiedHash = disk.lastNotifiedHash || lastYasnoNotifiedHash;
+        lastYasnoUpdatedOn = disk.lastUpdatedOn || lastYasnoUpdatedOn;
+        lastYasnoNotifiedUpdatedOn = disk.lastNotifiedUpdatedOn || lastYasnoNotifiedUpdatedOn;
+        return;
+    }
+
+    // Пам'ять свіжіша за диск (ефемерний FS / невдалий save) — лишаємо memory.
+}
+
+function isYasnoNotifyCooldownActive(now = Date.now()) {
+    return lastYasnoNotifyAt > 0 && now - lastYasnoNotifyAt < YASNO_NOTIFY_COOLDOWN_MS;
+}
+
 let yasnoState = loadYasnoState();
 let lastYasnoHash = yasnoState.lastHash;
 let lastYasnoNotifiedHash = yasnoState.lastNotifiedHash;
+let lastYasnoUpdatedOn = yasnoState.lastUpdatedOn;
+let lastYasnoNotifiedUpdatedOn = yasnoState.lastNotifiedUpdatedOn;
 let lastYasnoNotifyAt = yasnoState.lastNotifyAt;
 let yasnoCheckInProgress = false;
 let cachedYasnoGroup = null;
@@ -548,12 +602,14 @@ async function getYasnoSchedule() {
         if (!groupData) {
             return {
                 text: `⚠️ Групу ${group} не знайдено в графіку YASNO.`,
-                hash: null
+                hash: null,
+                updatedOn: null
             };
         }
 
-        // Хешуємо лише слоти/статус — не updatedOn і інші службові поля
+        // Хеш слотів — запасний сигнал; головний тригер сповіщень — updatedOn від YASNO
         const currentHash = yasnoContentHash(groupData);
+        const updatedOn = groupData.updatedOn || null;
 
         let text =
             `📅 *Графік відключень YASNO*\n` +
@@ -562,78 +618,80 @@ async function getYasnoSchedule() {
             `${formatDayBlock('Сьогодні', groupData.today)}\n\n` +
             `${formatDayBlock('Завтра', groupData.tomorrow)}`;
 
-        if (groupData.updatedOn) {
-            text += `\n\n🕒 Оновлено: ${formatUpdatedOn(groupData.updatedOn)}`;
+        if (updatedOn) {
+            text += `\n\n🕒 Оновлено: ${formatUpdatedOn(updatedOn)}`;
         }
 
-        return { text: text.slice(0, 4000), hash: currentHash, group };
+        return { text: text.slice(0, 4000), hash: currentHash, group, updatedOn };
     } catch (error) {
         console.error('Помилка отримання графіка YASNO:', error);
         cachedYasnoGroup = null;
-        return { text: '❌ Помилка з\'єднання з сервером графіків YASNO.', hash: null };
+        return { text: '❌ Помилка з\'єднання з сервером графіків YASNO.', hash: null, updatedOn: null };
     }
 }
 
 // Фонова перевірка лише графіка YASNO (без Tuya — економимо квоту API)
+// Головне: зміна updatedOn у YASNO → пуш одразу.
+// Cooldown 30 хв — лише антидубль того самого updatedOn (напр. два інстанси Render).
 setInterval(async () => {
     if (yasnoCheckInProgress) return;
     yasnoCheckInProgress = true;
     try {
-        // Підхоплюємо стан з диска (на випадок рестарту / другого процесу на тому ж диску)
-        yasnoState = loadYasnoState();
-        lastYasnoHash = yasnoState.lastHash;
-        lastYasnoNotifiedHash = yasnoState.lastNotifiedHash;
-        lastYasnoNotifyAt = yasnoState.lastNotifyAt;
+        mergeYasnoStateFromDisk();
 
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
-        if (lastYasnoHash === null) {
+        // Перший запуск / після втрати стану — лише baseline, без пушу
+        if (lastYasnoHash === null && lastYasnoUpdatedOn === null) {
             lastYasnoHash = result.hash;
-            saveYasnoState({
-                lastHash: lastYasnoHash,
-                lastNotifiedHash: lastYasnoNotifiedHash,
-                lastNotifyAt: lastYasnoNotifyAt
-            });
+            lastYasnoUpdatedOn = result.updatedOn;
+            persistYasnoState();
             return;
         }
 
-        if (result.hash === lastYasnoHash) {
+        const updatedOn = result.updatedOn || null;
+        const yasnoPublishedNewUpdate = Boolean(updatedOn) && updatedOn !== lastYasnoNotifiedUpdatedOn;
+        const sameUpdatedOnSeen = Boolean(updatedOn) && updatedOn === lastYasnoUpdatedOn;
+        const sameHash = result.hash === lastYasnoHash;
+        const hashOnlyChange = !updatedOn && result.hash !== lastYasnoNotifiedHash;
+
+        // Нічого нового відносно останнього сповіщення
+        if (!yasnoPublishedNewUpdate && !hashOnlyChange && sameHash && (sameUpdatedOnSeen || !updatedOn)) {
             return;
         }
 
+        if (updatedOn) {
+            lastYasnoUpdatedOn = updatedOn;
+        }
         lastYasnoHash = result.hash;
 
-        // Той самий контент уже відправляли — не дублюємо
-        if (result.hash === lastYasnoNotifiedHash) {
-            saveYasnoState({
-                lastHash: lastYasnoHash,
-                lastNotifiedHash: lastYasnoNotifiedHash,
-                lastNotifyAt: lastYasnoNotifyAt
-            });
-            console.log('YASNO: хеш вже був у сповіщенні, пропуск');
+        // Той самий "Останнє оновлення" з YASNO вже слали — антидубль
+        if (updatedOn && updatedOn === lastYasnoNotifiedUpdatedOn) {
+            persistYasnoState();
             return;
         }
 
-        // Антидубль по часу (30 хв)
-        if (Date.now() - lastYasnoNotifyAt < YASNO_NOTIFY_COOLDOWN_MS) {
-            saveYasnoState({
-                lastHash: lastYasnoHash,
-                lastNotifiedHash: lastYasnoNotifiedHash,
-                lastNotifyAt: lastYasnoNotifyAt
-            });
-            console.log('YASNO: пропуск дубля через cooldown');
+        if (!yasnoPublishedNewUpdate && !hashOnlyChange) {
+            persistYasnoState();
             return;
         }
 
-        // Фіксуємо ДО відправки, щоб паралельний тік/процес рідше продублював
+        // Новий updatedOn від YASNO → пуш одразу (без очікування 30 хв).
+        // Cooldown 30 хв — лише для fallback по хешу без updatedOn.
+        if (!yasnoPublishedNewUpdate && isYasnoNotifyCooldownActive()) {
+            persistYasnoState();
+            console.log('YASNO: пропуск дубля через cooldown (немає нового updatedOn)');
+            return;
+        }
+
+        const now = Date.now();
         lastYasnoNotifiedHash = result.hash;
-        lastYasnoNotifyAt = Date.now();
-        saveYasnoState({
-            lastHash: lastYasnoHash,
-            lastNotifiedHash: lastYasnoNotifiedHash,
-            lastNotifyAt: lastYasnoNotifyAt
-        });
+        lastYasnoNotifiedUpdatedOn = updatedOn || lastYasnoNotifiedUpdatedOn;
+        lastYasnoNotifyAt = now;
+        persistYasnoState();
+
+        console.log(`YASNO: сповіщення (updatedOn=${updatedOn || 'n/a'})`);
 
         const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
         const recipients = [...new Set(allowedUserIds())];
