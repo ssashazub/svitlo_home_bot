@@ -49,7 +49,6 @@ const bot = new Telegraf(TOKEN);
 const app = express();
 
 const YASNO_STATE_FILE = path.join(DATA_DIR, 'yasno-state.json');
-const YASNO_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000;
 
 function loadYasnoState() {
     try {
@@ -122,10 +121,6 @@ function mergeYasnoStateFromDisk() {
     }
 
     // Пам'ять свіжіша за диск (ефемерний FS / невдалий save) — лишаємо memory.
-}
-
-function isYasnoNotifyCooldownActive(now = Date.now()) {
-    return lastYasnoNotifyAt > 0 && now - lastYasnoNotifyAt < YASNO_NOTIFY_COOLDOWN_MS;
 }
 
 let yasnoState = loadYasnoState();
@@ -638,8 +633,8 @@ async function getYasnoSchedule() {
 }
 
 // Фонова перевірка лише графіка YASNO (без Tuya — економимо квоту API)
-// Головне: зміна updatedOn у YASNO → пуш одразу.
-// Cooldown 30 хв — лише антидубль того самого updatedOn (напр. два інстанси Render).
+// Пуш лише коли змінився ЗМІСТ графіка (хеш слотів/статусу).
+// Якщо YASNO кілька разів оновлює той самий графік (різний updatedOn) — не спамимо.
 setInterval(async () => {
     if (yasnoCheckInProgress) return;
     yasnoCheckInProgress = true;
@@ -651,10 +646,8 @@ setInterval(async () => {
 
         const updatedOn = result.updatedOn || null;
 
-        // Старт / деплой / міграція: засіюємо baseline БЕЗ пушу.
-        // Інакше після рестарту lastNotifiedUpdatedOn=null і старий updatedOn
-        // (напр. 09:22) сприймається як "нове оновлення".
-        if (lastYasnoNotifiedUpdatedOn === null || lastYasnoNotifiedHash === null) {
+        // Старт / деплой: baseline без пушу
+        if (lastYasnoNotifiedHash === null) {
             lastYasnoHash = result.hash;
             lastYasnoNotifiedHash = result.hash;
             lastYasnoUpdatedOn = updatedOn;
@@ -664,47 +657,32 @@ setInterval(async () => {
             return;
         }
 
-        const yasnoPublishedNewUpdate = Boolean(updatedOn) && updatedOn !== lastYasnoNotifiedUpdatedOn;
-        const sameUpdatedOnSeen = Boolean(updatedOn) && updatedOn === lastYasnoUpdatedOn;
-        const sameHash = result.hash === lastYasnoHash;
-        const hashOnlyChange = !updatedOn && result.hash !== lastYasnoNotifiedHash;
+        const contentChanged = result.hash !== lastYasnoNotifiedHash;
+        const updatedOnChanged = Boolean(updatedOn) && updatedOn !== lastYasnoUpdatedOn;
 
-        // Нічого нового відносно останнього сповіщення
-        if (!yasnoPublishedNewUpdate && !hashOnlyChange && sameHash && (sameUpdatedOnSeen || !updatedOn)) {
-            return;
-        }
-
+        lastYasnoHash = result.hash;
         if (updatedOn) {
             lastYasnoUpdatedOn = updatedOn;
         }
-        lastYasnoHash = result.hash;
 
-        // Той самий "Останнє оновлення" з YASNO вже слали — антидубль
-        if (updatedOn && updatedOn === lastYasnoNotifiedUpdatedOn) {
-            persistYasnoState();
+        // Той самий графік — навіть якщо YASNO змінив лише час "Оновлено"
+        if (!contentChanged) {
+            if (updatedOnChanged) {
+                lastYasnoNotifiedUpdatedOn = updatedOn;
+                persistYasnoState();
+                console.log(`YASNO: той самий графік, updatedOn=${updatedOn} — без пушу`);
+            }
             return;
         }
 
-        if (!yasnoPublishedNewUpdate && !hashOnlyChange) {
-            persistYasnoState();
-            return;
-        }
-
-        // Новий updatedOn від YASNO → пуш одразу (без очікування 30 хв).
-        // Cooldown 30 хв — лише для fallback по хешу без updatedOn.
-        if (!yasnoPublishedNewUpdate && isYasnoNotifyCooldownActive()) {
-            persistYasnoState();
-            console.log('YASNO: пропуск дубля через cooldown (немає нового updatedOn)');
-            return;
-        }
-
+        // Контент реально змінився → пуш одразу
         const now = Date.now();
         lastYasnoNotifiedHash = result.hash;
         lastYasnoNotifiedUpdatedOn = updatedOn || lastYasnoNotifiedUpdatedOn;
         lastYasnoNotifyAt = now;
         persistYasnoState();
 
-        console.log(`YASNO: сповіщення (updatedOn=${updatedOn || 'n/a'})`);
+        console.log(`YASNO: сповіщення (зміна графіка, updatedOn=${updatedOn || 'n/a'})`);
 
         const notificationText = `🔔 *Увага! Оновлено графік відключень для Ахматової, 13Д!*\n\n${result.text}`;
         const recipients = [...new Set(allowedUserIds())];
