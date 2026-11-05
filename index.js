@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const fetch = require('node-fetch');
+const { startTuyaPulsar } = require('./tuyaPulsar');
 
 // Токен твого бота та твій Telegram ID
 const TOKEN = "9162787820:AAGRrLMHNvkJJ7XarTyoWsCcUhXRUt3j9s0";
@@ -29,6 +30,8 @@ const TUYA_CLIENT_ID = process.env.TUYA_CLIENT_ID;
 const TUYA_SECRET = process.env.TUYA_SECRET;
 const DEVICE_ID = process.env.TUYA_DEVICE_ID || 'bff0b6603044b5be61heq2';
 const REGION = process.env.TUYA_REGION || 'eu';
+const TUYA_PULSAR_ENABLED = String(process.env.TUYA_PULSAR_ENABLED || 'true').toLowerCase() !== 'false';
+const TUYA_PULSAR_ENV = (process.env.TUYA_PULSAR_ENV || 'prod').toLowerCase();
 
 // Адреса для графіка YASNO (Київ, вул. Анни Ахматової, 13Д)
 const YASNO_REGION_ID = 25;
@@ -642,15 +645,21 @@ setInterval(async () => {
         const result = await getYasnoSchedule();
         if (!result.hash) return;
 
-        // Перший запуск / після втрати стану — лише baseline, без пушу
-        if (lastYasnoHash === null && lastYasnoUpdatedOn === null) {
+        const updatedOn = result.updatedOn || null;
+
+        // Старт / деплой / міграція: засіюємо baseline БЕЗ пушу.
+        // Інакше після рестарту lastNotifiedUpdatedOn=null і старий updatedOn
+        // (напр. 09:22) сприймається як "нове оновлення".
+        if (lastYasnoNotifiedUpdatedOn === null || lastYasnoNotifiedHash === null) {
             lastYasnoHash = result.hash;
-            lastYasnoUpdatedOn = result.updatedOn;
+            lastYasnoNotifiedHash = result.hash;
+            lastYasnoUpdatedOn = updatedOn;
+            lastYasnoNotifiedUpdatedOn = updatedOn;
             persistYasnoState();
+            console.log('YASNO: baseline після старту/деплою, без пушу');
             return;
         }
 
-        const updatedOn = result.updatedOn || null;
         const yasnoPublishedNewUpdate = Boolean(updatedOn) && updatedOn !== lastYasnoNotifiedUpdatedOn;
         const sameUpdatedOnSeen = Boolean(updatedOn) && updatedOn === lastYasnoUpdatedOn;
         const sameHash = result.hash === lastYasnoHash;
@@ -722,6 +731,48 @@ async function replyLightStatus(ctx) {
         return ctx.reply('🟢 Світло є!');
     }
     return ctx.reply('🔴 Світла немає!');
+}
+
+async function notifyLightPowerChange(kind) {
+    const text = kind === 'online'
+        ? '🟢 Зʼявилося світло!'
+        : '🔴 Зникло світло!';
+    const recipients = [...new Set(allowedUserIds())];
+
+    for (const userId of recipients) {
+        await bot.telegram.sendMessage(userId, text).catch((err) => {
+            console.error(`Не вдалося надіслати статус світла користувачу ${userId}:`, err.message || err);
+        });
+    }
+}
+
+function startTuyaPowerWatcher() {
+    if (!TUYA_PULSAR_ENABLED) {
+        console.log('Tuya Pulsar вимкнено (TUYA_PULSAR_ENABLED=false)');
+        return;
+    }
+    if (!TUYA_CLIENT_ID || !TUYA_SECRET) {
+        console.warn('Tuya Pulsar: немає TUYA_CLIENT_ID / TUYA_SECRET — авто-сповіщення світла вимкнені');
+        return;
+    }
+
+    startTuyaPulsar({
+        accessId: TUYA_CLIENT_ID,
+        accessKey: TUYA_SECRET,
+        region: REGION,
+        env: TUYA_PULSAR_ENV,
+        deviceId: DEVICE_ID,
+        logger: (level, ...args) => {
+            const line = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+            if (level === 'ERROR') console.error(line);
+            else if (level === 'WARN') console.warn(line);
+            else console.log(line);
+        },
+        onDevicePower: async (event) => {
+            console.log(`Tuya Pulsar: ${event.kind} для ${event.devId || DEVICE_ID}`);
+            await notifyLightPowerChange(event.kind);
+        }
+    });
 }
 
 async function replyYasnoSchedule(ctx) {
@@ -910,4 +961,7 @@ app.listen(PORT, async () => {
     } else {
         console.warn('RENDER_EXTERNAL_URL не задано — webhook не встановлено');
     }
+
+    // Миттєві сповіщення про світло через Tuya Message Service (Pulsar/WS)
+    startTuyaPowerWatcher();
 });
