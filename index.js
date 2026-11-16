@@ -338,7 +338,6 @@ async function notifyAdminsNewMember(from) {
     const memberEnv = recommendedMemberIdsEnv();
     const text =
         `👤 Новий юзер за інвайтом: ${name} (\`${from.id}\`)\n\n` +
-        `Щоб після деплою не треба було інвайтити знову — постав у Render:\n` +
         `\`MEMBER_IDS=${memberEnv}\``;
 
     for (const adminId of ADMIN_IDS) {
@@ -360,8 +359,7 @@ async function sendInviteLink(ctx) {
         const link = `https://t.me/${botUsername}?start=${code}`;
         // Без Markdown: інакше _ у username бота ламає повідомлення
         return ctx.reply(
-            `🎟️ Одноразове запрошення:\n${code}\n\n${link}\n\n` +
-            `Після входу оновлю MEMBER_IDS у Render — і доступ не злетить після деплою.`
+            `🎟️ Одноразове запрошення:\n${code}\n\n${link}\n\n`
         );
     } catch (error) {
         console.error('Помилка створення інвайту:', error);
@@ -910,7 +908,7 @@ bot.command('users', async (ctx) => {
     const memberEnv = recommendedMemberIdsEnv();
     return ctx.reply(
         `👥 Користувачі (${ids.length}):\n\n${lines.join('\n\n')}\n\n` +
-        `Скопіюй у Render:\n\`MEMBER_IDS=${memberEnv || '(поки порожньо)'}\``,
+        `MEMBER_IDS=${memberEnv || '(поки порожньо)'}`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -941,7 +939,7 @@ bot.command('kick', async (ctx) => {
 
     let text = `🗑️ Доступ для \`${targetId}\` прибрано з файлу.`;
     if (stillInEnv) {
-        text += `\n⚠️ Він ще в \`MEMBER_IDS\` — прибери ID з env на Render.`;
+        text += `\n⚠️ Він ще в \`MEMBER_IDS\` — треба прибрати ID з env на Render.`;
     }
 
     return ctx.reply(text, { parse_mode: 'Markdown' });
