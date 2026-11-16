@@ -915,7 +915,7 @@ bot.command('users', async (ctx) => {
     const memberEnv = recommendedMemberIdsEnv();
     return ctx.reply(
         `👥 Користувачі (${ids.length}):\n\n${lines.join('\n\n')}\n\n` +
-        `Скопіюй у Render:\n<code>MEMBER_IDS=${escapeHtml(memberEnv || '(поки порожньо)')}</code>`,
+        `<code>MEMBER_IDS=${escapeHtml(memberEnv || '(поки порожньо)')}</code>`,
         { parse_mode: 'HTML' }
     );
 });
