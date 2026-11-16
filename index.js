@@ -843,17 +843,30 @@ bot.command('users', async (ctx) => {
     const ids = allowedUserIds();
     const lines = ids.map((id, i) => {
         const fromFile = access.users.find((u) => Number(u.id) === id);
-        const uname = fromFile
-            ? (fromFile.username ? `@${fromFile.username}` : fromFile.name || '—')
-            : '—';
-        const role = isAdmin(id) ? 'admin' : MEMBER_IDS.includes(id) ? 'member(env)' : (fromFile?.role || 'member');
-        return `${i + 1}. ${escapeMarkdown(uname)} — \`${id}\` (${escapeMarkdown(role)})`;
+        const name = fromFile?.name || 'невідомо';
+        const username = fromFile?.username ? ` (@${fromFile.username})` : '';
+        const inEnv = MEMBER_IDS.includes(id);
+
+        let mark;
+        if (isAdmin(id)) {
+            mark = '🔑 адмін';
+        } else if (inEnv) {
+            mark = '✅ у MEMBER\\_IDS';
+        } else {
+            mark = '⚠️ лише в файлі (злетить після деплою)';
+        }
+
+        return (
+            `${i + 1}. *${escapeMarkdown(name)}*${escapeMarkdown(username)}\n` +
+            `   ID: \`${id}\`\n` +
+            `   ${mark}`
+        );
     });
 
     const memberEnv = recommendedMemberIdsEnv();
     return ctx.reply(
-        `👥 Користувачі:\n${lines.join('\n')}\n\n` +
-        `MEMBER\\_IDS для Render:\n\`MEMBER_IDS=${memberEnv || '(поки порожньо)'}\``,
+        `👥 Користувачі (${ids.length}):\n\n${lines.join('\n\n')}\n\n` +
+        `Скопіюй у Render:\n\`MEMBER_IDS=${memberEnv || '(поки порожньо)'}\``,
         { parse_mode: 'Markdown' }
     );
 });
