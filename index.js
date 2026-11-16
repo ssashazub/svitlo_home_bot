@@ -276,6 +276,13 @@ function escapeMarkdown(text) {
     return String(text).replace(/([_*`\[])/g, '\\$1');
 }
 
+function escapeHtml(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 function mainKeyboard(userId) {
     const rows = [
         ['💡 Перевірити світло вдома'],
@@ -885,22 +892,22 @@ bot.command('users', async (ctx) => {
 
     const lines = profiles.map((profile, i) => {
         const id = Number(profile.id);
-        const name = profile.name || String(id);
-        const username = profile.username ? ` (@${profile.username})` : '';
+        const name = escapeHtml(profile.name || String(id));
+        const username = profile.username ? ` (@${escapeHtml(profile.username)})` : '';
         const inEnv = MEMBER_IDS.includes(id);
 
         let mark;
         if (isAdmin(id)) {
             mark = '🔑 адмін';
         } else if (inEnv) {
-            mark = '✅ у MEMBER\\_IDS';
+            mark = '✅ у MEMBER_IDS';
         } else {
             mark = '⚠️ лише в файлі (злетить після деплою)';
         }
 
         return (
-            `${i + 1}. *${escapeMarkdown(name)}*${escapeMarkdown(username)}\n` +
-            `   ID: \`${id}\`\n` +
+            `${i + 1}. <b>${name}</b>${username}\n` +
+            `   ID: <code>${id}</code>\n` +
             `   ${mark}`
         );
     });
@@ -908,8 +915,8 @@ bot.command('users', async (ctx) => {
     const memberEnv = recommendedMemberIdsEnv();
     return ctx.reply(
         `👥 Користувачі (${ids.length}):\n\n${lines.join('\n\n')}\n\n` +
-        `MEMBER_IDS=${memberEnv || '(поки порожньо)'}`,
-        { parse_mode: 'Markdown' }
+        `Скопіюй у Render:\n<code>MEMBER_IDS=${escapeHtml(memberEnv || '(поки порожньо)')}</code>`,
+        { parse_mode: 'HTML' }
     );
 });
 
