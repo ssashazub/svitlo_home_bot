@@ -140,7 +140,12 @@ function defaultAccess() {
     };
 }
 
-function ensureUserRecord(parsed, id, role, name = role) {
+function isPlaceholderName(name, id) {
+    const n = String(name || '').trim().toLowerCase();
+    return !n || n === 'admin' || n === 'member' || n === 'невідомо' || n === String(id);
+}
+
+function ensureUserRecord(parsed, id, role) {
     const existing = parsed.users.find((u) => Number(u.id) === Number(id));
     if (existing) {
         existing.role = role;
@@ -148,13 +153,47 @@ function ensureUserRecord(parsed, id, role, name = role) {
     }
     const row = {
         id: Number(id),
-        name,
+        name: String(id),
         username: null,
         role,
         joinedAt: new Date().toISOString()
     };
     parsed.users.push(row);
     return row;
+}
+
+async function resolveUserProfile(id) {
+    const fromFile = access.users.find((u) => Number(u.id) === Number(id));
+    if (fromFile && !isPlaceholderName(fromFile.name, id)) {
+        return fromFile;
+    }
+
+    try {
+        const chat = await bot.telegram.getChat(id);
+        const name =
+            [chat.first_name, chat.last_name].filter(Boolean).join(' ') ||
+            chat.username ||
+            String(id);
+        const profile = {
+            id: Number(id),
+            name,
+            username: chat.username || null,
+            role: isAdmin(id) ? 'admin' : 'member',
+            joinedAt: fromFile?.joinedAt || new Date().toISOString()
+        };
+        if (fromFile) Object.assign(fromFile, profile);
+        else access.users.push(profile);
+        saveAccess(access);
+        return profile;
+    } catch (error) {
+        console.warn(`Не вдалося отримати профіль ${id}:`, error.message || error);
+        return fromFile || {
+            id: Number(id),
+            name: String(id),
+            username: null,
+            role: isAdmin(id) ? 'admin' : 'member'
+        };
+    }
 }
 
 function loadAccess() {
@@ -167,20 +206,20 @@ function loadAccess() {
 
         // Адміни + MEMBER_IDS з env завжди в списку (переживають редеплой)
         for (const adminId of ADMIN_IDS) {
-            ensureUserRecord(parsed, adminId, 'admin', 'admin');
+            ensureUserRecord(parsed, adminId, 'admin');
         }
         for (const memberId of MEMBER_IDS) {
             if (!ADMIN_IDS.includes(memberId)) {
-                ensureUserRecord(parsed, memberId, 'member', 'member');
+                ensureUserRecord(parsed, memberId, 'member');
             }
         }
         return parsed;
     } catch (error) {
         console.error('Не вдалося прочитати access.json:', error);
         const fallback = defaultAccess();
-        for (const adminId of ADMIN_IDS) ensureUserRecord(fallback, adminId, 'admin', 'admin');
+        for (const adminId of ADMIN_IDS) ensureUserRecord(fallback, adminId, 'admin');
         for (const memberId of MEMBER_IDS) {
-            if (!ADMIN_IDS.includes(memberId)) ensureUserRecord(fallback, memberId, 'member', 'member');
+            if (!ADMIN_IDS.includes(memberId)) ensureUserRecord(fallback, memberId, 'member');
         }
         return fallback;
     }
@@ -841,10 +880,15 @@ bot.command('users', async (ctx) => {
 
     access = loadAccess();
     const ids = allowedUserIds();
-    const lines = ids.map((id, i) => {
-        const fromFile = access.users.find((u) => Number(u.id) === id);
-        const name = fromFile?.name || 'невідомо';
-        const username = fromFile?.username ? ` (@${fromFile.username})` : '';
+    const profiles = [];
+    for (const id of ids) {
+        profiles.push(await resolveUserProfile(id));
+    }
+
+    const lines = profiles.map((profile, i) => {
+        const id = Number(profile.id);
+        const name = profile.name || String(id);
+        const username = profile.username ? ` (@${profile.username})` : '';
         const inEnv = MEMBER_IDS.includes(id);
 
         let mark;
