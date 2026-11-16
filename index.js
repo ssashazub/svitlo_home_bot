@@ -231,6 +231,12 @@ function recommendedMemberIdsEnv() {
     return ids.join(',');
 }
 
+// Legacy Markdown: _, *, `, [ починають сутність і мають пару.
+// Інакше Telegram відповідає "Can't find end of the entity".
+function escapeMarkdown(text) {
+    return String(text).replace(/([_*`\[])/g, '\\$1');
+}
+
 function mainKeyboard(userId) {
     const rows = [
         ['💡 Перевірити світло вдома'],
@@ -287,7 +293,9 @@ function redeemInvite(code, from) {
 }
 
 async function notifyAdminsNewMember(from) {
-    const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || from.id;
+    const name = escapeMarkdown(
+        [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || from.id
+    );
     const memberEnv = recommendedMemberIdsEnv();
     const text =
         `👤 Новий юзер за інвайтом: ${name} (\`${from.id}\`)\n\n` +
@@ -839,13 +847,13 @@ bot.command('users', async (ctx) => {
             ? (fromFile.username ? `@${fromFile.username}` : fromFile.name || '—')
             : '—';
         const role = isAdmin(id) ? 'admin' : MEMBER_IDS.includes(id) ? 'member(env)' : (fromFile?.role || 'member');
-        return `${i + 1}. ${uname} — \`${id}\` (${role})`;
+        return `${i + 1}. ${escapeMarkdown(uname)} — \`${id}\` (${escapeMarkdown(role)})`;
     });
 
     const memberEnv = recommendedMemberIdsEnv();
     return ctx.reply(
         `👥 Користувачі:\n${lines.join('\n')}\n\n` +
-        `MEMBER_IDS для Render:\n\`MEMBER_IDS=${memberEnv || '(поки порожньо)'}\``,
+        `MEMBER\\_IDS для Render:\n\`MEMBER_IDS=${memberEnv || '(поки порожньо)'}\``,
         { parse_mode: 'Markdown' }
     );
 });
