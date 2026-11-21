@@ -767,16 +767,47 @@ async function replyLightStatus(ctx) {
     return ctx.reply('🔴 Світла немає!');
 }
 
+async function sendTelegramWithRetry(userId, text, label, attempts = 3) {
+    let lastError = null;
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            await bot.telegram.sendMessage(userId, text);
+            return true;
+        } catch (err) {
+            lastError = err;
+            const msg = String(err.message || err);
+            const retryable = /\b(502|503|504|ECONNRESET|ETIMEDOUT|socket hang up)\b/i.test(msg);
+            if (!retryable || i === attempts) break;
+            const waitMs = 500 * i;
+            console.warn(`${label}: ${msg} — повтор ${i}/${attempts} через ${waitMs}мс`);
+            await new Promise((r) => setTimeout(r, waitMs));
+        }
+    }
+    console.error(`${label}:`, lastError && (lastError.message || lastError));
+    return false;
+}
+
 async function notifyLightPowerChange(kind) {
     const text = kind === 'online'
         ? '🟢 Зʼявилося світло!'
         : '🔴 Зникло світло!';
     const recipients = [...new Set(allowedUserIds())];
 
+    if (!recipients.length) {
+        console.warn(`Світло (${kind}): немає отримувачів (ADMIN_IDS / MEMBER_IDS / access.json)`);
+        return;
+    }
+
+    console.log(`Світло (${kind}): надсилаю ${recipients.length} користувачам`);
     for (const userId of recipients) {
-        await bot.telegram.sendMessage(userId, text).catch((err) => {
-            console.error(`Не вдалося надіслати статус світла користувачу ${userId}:`, err.message || err);
-        });
+        const ok = await sendTelegramWithRetry(
+            userId,
+            text,
+            `Не вдалося надіслати статус світла користувачу ${userId}`
+        );
+        if (ok) {
+            console.log(`Світло (${kind}): надіслано ${userId}`);
+        }
     }
 }
 

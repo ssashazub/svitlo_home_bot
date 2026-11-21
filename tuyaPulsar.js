@@ -8,6 +8,9 @@ const REGION_URL = {
     in: 'wss://mqe.tuyain.com:8285/'
 };
 
+const PING_INTERVAL_MS = 30 * 1000;
+const PONG_TIMEOUT_MS = 90 * 1000;
+
 function md5Hex(value) {
     return crypto.createHash('md5').update(value).digest('hex');
 }
@@ -97,7 +100,7 @@ function startTuyaPulsar(options) {
     const region = String(options.region || 'eu').toLowerCase();
     const envName = String(options.env || 'prod').toLowerCase() === 'test' ? 'test' : 'prod';
     const deviceId = String(options.deviceId || '').trim();
-    const logger = options.logger || console.log;
+    const logger = options.logger || ((level, ...args) => console.log(level, ...args));
     const onDevicePower = options.onDevicePower;
 
     if (!accessId || !accessKey || !deviceId) {
@@ -114,26 +117,77 @@ function startTuyaPulsar(options) {
     let retryDelayMs = 1000;
     let keepAliveTimer = null;
     let reconnectTimer = null;
+    let connId = 0;
+    let lastPongAt = 0;
     let lastKind = null;
     let lastNotifyAt = 0;
     const DEDUP_MS = 15 * 1000;
 
     function clearKeepAlive() {
-        if (keepAliveTimer) clearTimeout(keepAliveTimer);
+        if (keepAliveTimer) clearInterval(keepAliveTimer);
         keepAliveTimer = null;
     }
 
-    function scheduleKeepAlive() {
-        clearKeepAlive();
-        keepAliveTimer = setTimeout(() => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                try {
-                    ws.ping(accessId);
-                } catch (error) {
-                    logger('ERROR', 'Tuya Pulsar ping failed:', error.message || error);
-                }
+    function clearReconnect() {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    function disposeSocket(socket, reason) {
+        if (!socket) return;
+        try {
+            socket.removeAllListeners();
+        } catch (_) { /* ignore */ }
+        try {
+            // terminate() одразу рве TCP — важливо для зомбі-сокета
+            if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+                socket.terminate();
             }
-        }, 30000);
+        } catch (_) { /* ignore */ }
+        if (reason) {
+            logger('INFO', `Tuya Pulsar: dispose (${reason})`);
+        }
+    }
+
+    /**
+     * Раніше був setTimeout → один ping і тиша.
+     * На idle (немає подій світла) Tuya/мережа могли «вбити» WS без close,
+     * а HTTP (UptimeRobot) лишався живим → Consumers:0 при «живому» боті.
+     */
+    function startKeepAlive(myId) {
+        clearKeepAlive();
+        lastPongAt = Date.now();
+        keepAliveTimer = setInterval(() => {
+            if (myId !== connId || stopped) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const silentFor = Date.now() - lastPongAt;
+            if (silentFor > PONG_TIMEOUT_MS) {
+                logger('WARN', `Tuya Pulsar: немає pong ${Math.round(silentFor / 1000)}с — force reconnect`);
+                disposeSocket(ws, 'pong-timeout');
+                ws = null;
+                scheduleReconnect();
+                return;
+            }
+
+            try {
+                ws.ping(accessId);
+            } catch (error) {
+                logger('ERROR', 'Tuya Pulsar ping failed:', error.message || error);
+                disposeSocket(ws, 'ping-error');
+                ws = null;
+                scheduleReconnect();
+            }
+        }, PING_INTERVAL_MS);
+    }
+
+    function scheduleReconnect() {
+        if (stopped) return;
+        clearKeepAlive();
+        clearReconnect();
+        logger('INFO', `Tuya Pulsar: reconnect через ${retryDelayMs}мс`);
+        reconnectTimer = setTimeout(connect, retryDelayMs);
+        retryDelayMs = Math.min(retryDelayMs * 2, 60 * 1000);
     }
 
     function ack(messageId) {
@@ -159,12 +213,29 @@ function startTuyaPulsar(options) {
             || payloadJson.encryptType
             || '';
 
-        const decrypted = decryptPayloadData(payloadJson.data, accessKey, modeHint);
+        let decrypted;
+        try {
+            decrypted = decryptPayloadData(payloadJson.data, accessKey, modeHint);
+        } catch (error) {
+            // Без ack повідомлення лишиться в Accumulated — логимо явно
+            logger('ERROR', 'Tuya Pulsar decrypt failed (без ack):', error.message || error);
+            throw error;
+        }
+
         const event = normalizeEvent(decrypted);
         ack(messageId);
 
-        if (!event) return;
-        if (event.devId && event.devId !== deviceId) return;
+        if (!event) {
+            const bizCode = decrypted && (decrypted.bizCode || decrypted.bizcode || decrypted.eventType);
+            if (bizCode) {
+                logger('INFO', `Tuya Pulsar: ігнор bizCode=${bizCode}`);
+            }
+            return;
+        }
+        if (event.devId && event.devId !== deviceId) {
+            logger('INFO', `Tuya Pulsar: інший пристрій ${event.devId}`);
+            return;
+        }
 
         const now = Date.now();
         if (event.kind === lastKind && now - lastNotifyAt < DEDUP_MS) {
@@ -179,25 +250,37 @@ function startTuyaPulsar(options) {
 
     function connect() {
         if (stopped) return;
-        clearTimeout(reconnectTimer);
+        clearReconnect();
         clearKeepAlive();
 
-        logger('INFO', `Tuya Pulsar: підключення (${region}/${envName})...`);
-        ws = new WebSocket(url, {
+        // Закриваємо попередній сокет, щоб не було 2 consumers у Failover
+        if (ws) {
+            disposeSocket(ws, 'before-reconnect');
+            ws = null;
+        }
+
+        const myId = ++connId;
+        logger('INFO', `Tuya Pulsar: підключення #${myId} (${region}/${envName})...`);
+
+        const socket = new WebSocket(url, {
             headers: {
                 username: accessId,
                 password
             }
         });
+        ws = socket;
 
-        ws.on('open', () => {
+        socket.on('open', () => {
+            if (myId !== connId) return;
             retryDelayMs = 1000;
-            logger('INFO', 'Tuya Pulsar: зʼєднання відкрито');
-            scheduleKeepAlive();
+            lastPongAt = Date.now();
+            logger('INFO', `Tuya Pulsar: зʼєднання відкрито (#${myId})`);
+            startKeepAlive(myId);
         });
 
-        ws.on('message', async (data) => {
-            scheduleKeepAlive();
+        socket.on('message', async (data) => {
+            if (myId !== connId) return;
+            lastPongAt = Date.now();
             try {
                 await handleRawMessage(data);
             } catch (error) {
@@ -205,27 +288,32 @@ function startTuyaPulsar(options) {
             }
         });
 
-        ws.on('ping', () => {
-            scheduleKeepAlive();
+        socket.on('ping', () => {
+            if (myId !== connId) return;
+            lastPongAt = Date.now();
             try {
-                ws.pong(accessId);
+                socket.pong(accessId);
             } catch (_) { /* ignore */ }
         });
 
-        ws.on('pong', () => {
-            scheduleKeepAlive();
+        socket.on('pong', () => {
+            if (myId !== connId) return;
+            lastPongAt = Date.now();
         });
 
-        ws.on('error', (error) => {
-            logger('ERROR', 'Tuya Pulsar socket error:', error.message || error);
+        socket.on('error', (error) => {
+            if (myId !== connId) return;
+            logger('ERROR', `Tuya Pulsar socket error (#${myId}):`, error.message || error);
         });
 
-        ws.on('close', (code, reason) => {
+        socket.on('close', (code, reason) => {
+            if (myId !== connId) return;
             clearKeepAlive();
-            logger('WARN', `Tuya Pulsar: закрито (${code}) ${reason || ''}`.trim());
+            const why = reason && reason.toString ? reason.toString() : String(reason || '');
+            logger('WARN', `Tuya Pulsar: закрито (#${myId}, code=${code})${why ? ` ${why}` : ''}`);
+            if (ws === socket) ws = null;
             if (stopped) return;
-            reconnectTimer = setTimeout(connect, retryDelayMs);
-            retryDelayMs = Math.min(retryDelayMs * 2, 60 * 1000);
+            scheduleReconnect();
         });
     }
 
@@ -234,13 +322,10 @@ function startTuyaPulsar(options) {
     return {
         stop() {
             stopped = true;
-            clearTimeout(reconnectTimer);
+            clearReconnect();
             clearKeepAlive();
-            if (ws) {
-                try {
-                    ws.close();
-                } catch (_) { /* ignore */ }
-            }
+            disposeSocket(ws, 'stop');
+            ws = null;
         }
     };
 }
